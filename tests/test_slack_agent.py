@@ -76,6 +76,32 @@ def test_tool_registry_consistency():
     )
 
 
+def test_copy_squad_handles_null_sequence_in_body_output():
+    """Regression: 2026-04-28 (second occurrence) — body squad output
+    {"sequence": null} crashed write_one with
+    `TypeError: 'NoneType' object is not iterable` because
+    sequence.get("sequence", []) returns None for explicit null.
+
+    Same null-default-vs-explicit-null bug as the pick fix; refactored to use
+    _safe_list helper that coerces None → [] regardless of how it got there.
+    """
+    from squads.copy.squad import _safe_list, _pick_candidate
+
+    # _safe_list — never returns None
+    assert _safe_list(None) == []
+    assert _safe_list([1, 2]) == [1, 2]
+    assert _safe_list({"x": 1}) == []
+    assert _safe_list("string") == []
+    assert _safe_list(0) == []
+
+    # _pick_candidate — never crashes
+    assert _pick_candidate({"candidates": ["a", "b"], "pick": None}) == "a"
+    assert _pick_candidate({"candidates": None, "pick": 0}) == ""
+    assert _pick_candidate({}) == ""
+    assert _pick_candidate({"candidates": ["x", "y", "z"], "pick": 99}) == "z"
+    assert _pick_candidate({"candidates": ["a"], "pick": -5}) == "a"
+
+
 def test_copy_squad_handles_null_pick_in_hook():
     """Regression: 2026-04-28 — Copy squad's _draft_body crashed with
     `TypeError: list indices must be integers or slices, not NoneType`
@@ -110,4 +136,5 @@ if __name__ == "__main__":
     test_serialization_handles_anthropic_blocks_via_run_tools_logic()
     test_tool_registry_consistency()
     test_copy_squad_handles_null_pick_in_hook()
+    test_copy_squad_handles_null_sequence_in_body_output()
     print("All slack_agent regression tests pass ✓")

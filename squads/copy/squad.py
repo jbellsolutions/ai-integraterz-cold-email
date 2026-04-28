@@ -103,13 +103,14 @@ class CopySquad:
         hook = await self._draft_hook(lead, signal)
         for attempt in range(max_retries + 1):
             sequence = await self._draft_body(lead, signal, hook)
-            full_text = "\n".join(e.get("subject", "") + "\n" + e.get("body", "") for e in sequence.get("sequence", []))
+            seq_list = _safe_list(sequence.get("sequence"))
+            full_text = "\n".join((e.get("subject") or "") + "\n" + (e.get("body") or "") for e in seq_list)
             passes, hits = slop_check(full_text)
             if passes:
                 out = {
                     "lead_id": lead.email,
-                    "sequence": sequence.get("sequence", []),
-                    "picked_hook": hook.get("candidates", [None] * 3)[hook.get("pick", 0)],
+                    "sequence": seq_list,
+                    "picked_hook": _pick_candidate(hook),
                     "slop_pass": True,
                     "slop_attempts": attempt + 1,
                 }
@@ -118,8 +119,8 @@ class CopySquad:
         # Final attempt failed slop — still save with flag
         out = {
             "lead_id": lead.email,
-            "sequence": sequence.get("sequence", []),
-            "picked_hook": hook.get("candidates", [None] * 3)[hook.get("pick", 0)],
+            "sequence": seq_list,
+            "picked_hook": _pick_candidate(hook),
             "slop_pass": False,
             "slop_violations": hits,
             "slop_attempts": max_retries + 1,
@@ -148,14 +149,7 @@ class CopySquad:
             max_turns=4,
         )
         spec = SwarmSpec(topology=Topology.SOLO, consensus=Consensus.QUEEN, members=[routing["body"]])
-        # `.get("pick", 0)` returns None if the key exists with value None
-        # (the LLM sometimes emits {"pick": null}). Coerce defensively, clamp.
-        candidates = hook.get("candidates") or [""]
-        pick = hook.get("pick")
-        if not isinstance(pick, int):
-            pick = 0
-        pick = max(0, min(pick, len(candidates) - 1))
-        chosen = candidates[pick]
+        chosen = _pick_candidate(hook)
         task = (
             f"PROSPECT: {lead.name} ({lead.title}) at {lead.company}\n"
             f"SIGNAL: {json.dumps(signal)}\n"
@@ -171,6 +165,24 @@ class CopySquad:
         out_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^a-zA-Z0-9]+", "_", lead.email)
         (out_dir / f"{safe}.json").write_text(json.dumps(out, indent=2))
+
+
+def _safe_list(v) -> list:
+    """Coerce LLM output to a list. Handles None, dict, scalar."""
+    if isinstance(v, list):
+        return v
+    return []
+
+
+def _pick_candidate(hook: dict) -> str:
+    """Pick the chosen hook candidate. Defends against {"pick": null} or
+    out-of-range indices (the LLM emits both occasionally)."""
+    candidates = _safe_list(hook.get("candidates")) or [""]
+    pick = hook.get("pick")
+    if not isinstance(pick, int):
+        pick = 0
+    pick = max(0, min(pick, len(candidates) - 1))
+    return candidates[pick] if candidates else ""
 
 
 def _safe_json(text: str, default: dict) -> dict:
