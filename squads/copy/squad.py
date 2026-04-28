@@ -39,21 +39,54 @@ campaign brief (which includes positioning, offer, voice rules, and the \
 canonical sequences.md template), and a prospect signal, write the full 3-email \
 sequence.
 
-Hard rules:
-- Email 1: <125 words, no links, no bold, no HTML, reply-based CTA only.
-- Email 2: <150 words, ONE link max (calendar OR one-pager).
-- Email 3: <125 words, calendar link allowed.
+# THE FUNDAMENTAL FRAME (read this first — every other rule serves it)
+
+A cold email is the START of a conversation, NOT a pitch.
+
+You are not selling. You are opening a door. You are an operator like them \
+who has something interesting and wants to know if they want to hear about it. \
+That's the whole frame. If your draft reads like marketing, like a program, \
+like a "free offer" — rewrite it. If it reads like an operator messaging another \
+operator with a curious observation and a low-friction question — ship it.
+
+# HARD RULES
+
+- *No links in emails 1, 2, or 3*. Not the first email, not the second, not \
+the third. Calendar links, website links, one-pagers — NONE. Links go in the \
+*reply* after the prospect has answered AND asked. (See "Why no links" below.)
+- *Emails 2 and 3 MUST reuse Email 1's subject line verbatim* so they thread \
+together in the prospect's inbox. If the subject changes, the thread breaks \
+and the follow-up reads like a separate cold email — fatal. Use the SAME string.
+- *Don't sell*. Don't say "free", don't pitch a "program", don't promise \
+specific timeframes ("14-day sprint", "6-10 weeks") UNLESS the campaign brief \
+explicitly approves the number for this audience. Promised timeframes feel \
+like fake-urgency salsa.
+- *No "AI sourcing agent" framing* unless the brief says otherwise. The default \
+language across recruiter campaigns is "AI built solutions" / "an AI [role]" / \
+"AI techs, VAs, chief officers" — match the brief's voice.
+- *Email 1: ≤125 words*, no links, no bold, no HTML, reply-based CTA only \
+("worth a 12-min Loom?", "want me to send the breakdown?", "useful?").
+- *Email 2: ≤150 words*, no links. Reference the first email lightly without \
+"just following up" or "circling back" (slop). New angle, same subject line.
+- *Email 3: ≤125 words*, no links. Soft permission close — "ok to assume this \
+isn't a fit?" / "want me to drop it?" — never demanding.
 - Mobile-formatted (short paragraphs, blank lines between).
-- Use sequences.md as the structural template — adapt the opening to fit the \
-chosen hook and signal.
 - Sign off "-- Justin"
-- Subject lines: target ≤33 chars, max 60.
+- Subject lines (Email 1 only): target ≤33 chars, max 60. Lowercase or sentence \
+case, no Title Case, no emoji.
+
+# Why no links
+
+Cold inboxes have heuristics that downrank messages with URLs in the first few \
+exchanges. Spam filters, Gmail tabs, and prospects themselves treat link-in-cold \
+as marketing/automation. The reply-first protocol is what gets human responses. \
+The prospect's reply is the trigger for the link, not your initial outreach.
 
 Output format (JSON only):
 { "sequence": [
-    {"step": 1, "subject": "...", "body": "...", "delay_days": 0},
-    {"step": 2, "subject": "...", "body": "...", "delay_days": 3},
-    {"step": 3, "subject": "...", "body": "...", "delay_days": 7}
+    {"step": 1, "subject": "<short subject>", "body": "<email 1 body>", "delay_days": 0},
+    {"step": 2, "subject": "<EXACTLY the same subject as step 1>", "body": "<email 2 body>", "delay_days": 3},
+    {"step": 3, "subject": "<EXACTLY the same subject as step 1>", "body": "<email 3 body>", "delay_days": 7}
 ] }"""
 
 # Phrases that prove an LLM didn't think — hard ban.
@@ -93,20 +126,100 @@ def slop_check(text: str) -> tuple[bool, list[str]]:
     return (len(hits) == 0, hits)
 
 
+# Patterns that indicate selling-not-conversation tone (Justin's feedback rule):
+# fake timeframes, "free", program-language, sourcing-agent default.
+SALES_PATTERNS = [
+    "14-day sprint", "14 day sprint",
+    "30-day sprint", "30 day sprint",
+    "6-10 weeks", "6 to 10 weeks", "six to ten weeks",
+    "for free", "completely free", "absolutely free",
+    "ai sourcing agent",  # banned default unless brief overrides
+    "this program", "our program",
+    "limited spots", "limited time",
+    "act now", "don't miss",
+]
+
+
+def sales_check(text: str) -> tuple[bool, list[str]]:
+    """Catches selling-not-conversation tone. Justin's rule: cold email is the
+    start of a conversation, not a pitch. Returns (passes, violations)."""
+    lower = text.lower()
+    return ([] == (hits := [p for p in SALES_PATTERNS if p in lower]), hits)
+
+
+URL_RE = re.compile(r"https?://\S+|www\.\S+|\b[a-z0-9.-]+\.(com|io|ai|co|net|org)\b/\S+",
+                       re.IGNORECASE)
+
+
+def url_check(sequence: list[dict]) -> tuple[bool, list[str]]:
+    """Justin's rule: NO links in emails 1, 2, or 3. Returns (passes, violations)."""
+    violations: list[str] = []
+    for step in sequence:
+        si = step.get("step", "?")
+        body = step.get("body", "") or ""
+        urls = URL_RE.findall(body)
+        if urls:
+            violations.append(f"email {si} contains URL(s): {urls}")
+    return (len(violations) == 0, violations)
+
+
+def threading_check(sequence: list[dict]) -> tuple[bool, list[str]]:
+    """Emails 2 and 3 must reuse email 1's subject so they thread."""
+    if len(sequence) < 2:
+        return True, []
+    subjects = [(s.get("step", i + 1), (s.get("subject") or "").strip())
+                  for i, s in enumerate(sequence)]
+    s1 = subjects[0][1]
+    violations = [f"email {i} subject differs from email 1 ('{s}' ≠ '{s1}')"
+                   for i, s in subjects[1:] if s != s1]
+    return (len(violations) == 0, violations)
+
+
+def _load_voice_rules() -> str:
+    """Load Justin's global voice rules. Applied on TOP of every campaign brief.
+    Updates here propagate to the next preview / launch — no per-campaign edits
+    needed when the rules change."""
+    p = REPO_ROOT / "data" / "voice_rules.md"
+    if p.exists():
+        return p.read_text()
+    return ""
+
+
 class CopySquad:
     def __init__(self, brief: str):
-        self.brief = brief
+        # Voice rules go on top of brief — they override the brief if conflicts.
+        voice = _load_voice_rules()
+        self.brief = (
+            (f"# JUSTIN'S VOICE RULES (override the campaign brief if conflicts)\n\n{voice}\n\n---\n\n"
+              if voice else "")
+            + brief
+        )
         self.tools = ToolRegistry()
 
     async def write_one(self, lead: Lead, signal: dict, max_retries: int = 2) -> dict:
-        """Hook → body → slop check, with retry on slop fail."""
+        """Hook → body → all checks (slop + sales + URLs + threading), with
+        retry on any failure."""
         hook = await self._draft_hook(lead, signal)
+        all_violations: list[str] = []
         for attempt in range(max_retries + 1):
             sequence = await self._draft_body(lead, signal, hook)
             seq_list = _safe_list(sequence.get("sequence"))
             full_text = "\n".join((e.get("subject") or "") + "\n" + (e.get("body") or "") for e in seq_list)
-            passes, hits = slop_check(full_text)
-            if passes:
+
+            slop_pass, slop_hits = slop_check(full_text)
+            sales_pass, sales_hits = sales_check(full_text)
+            url_pass, url_hits = url_check(seq_list)
+            thread_pass, thread_hits = threading_check(seq_list)
+
+            all_passed = slop_pass and sales_pass and url_pass and thread_pass
+            all_violations = (
+                [f"slop: {h}" for h in slop_hits]
+                + [f"sales-tone: {h}" for h in sales_hits]
+                + [f"url-rule: {h}" for h in url_hits]
+                + [f"threading: {h}" for h in thread_hits]
+            )
+
+            if all_passed:
                 out = {
                     "lead_id": lead.email,
                     "sequence": seq_list,
@@ -116,13 +229,13 @@ class CopySquad:
                 }
                 self._save(lead, out)
                 return out
-        # Final attempt failed slop — still save with flag
+        # Final attempt failed — still save with flag and full violation list
         out = {
             "lead_id": lead.email,
             "sequence": seq_list,
             "picked_hook": _pick_candidate(hook),
             "slop_pass": False,
-            "slop_violations": hits,
+            "slop_violations": all_violations,
             "slop_attempts": max_retries + 1,
         }
         self._save(lead, out)

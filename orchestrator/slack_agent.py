@@ -462,6 +462,66 @@ def _slack_chunk(text: str, limit: int = 3500) -> list[str]:
     return chunks
 
 
+def tool_update_voice_rules(args: dict) -> dict:
+    """Append or replace global voice rules (Justin's tone overrides for every
+    campaign). Writes data/voice_rules.md. Loaded by the Copy squad on top of
+    every brief.
+
+    args.append: text to append to the current rules (preserves existing).
+    args.replace: full replacement of voice_rules.md (use sparingly).
+
+    Use this when the user gives feedback like "stop saying X across all
+    campaigns" or "the voice should sound more like Y" — feedback that's
+    NOT specific to one campaign brief.
+    """
+    p = REPO_ROOT / "data" / "voice_rules.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if "replace" in args:
+        p.write_text(args["replace"])
+        return {"updated": True, "mode": "replace", "chars": len(args["replace"]),
+                  "file": "data/voice_rules.md"}
+    if "append" in args:
+        existing = p.read_text() if p.exists() else ""
+        block = (
+            f"\n\n## Update — {dt.datetime.utcnow().date().isoformat()}\n\n"
+            + args["append"]
+        )
+        p.write_text(existing + block)
+        return {"updated": True, "mode": "append",
+                  "appended_chars": len(args["append"]), "file": "data/voice_rules.md"}
+    return {"error": "supply either 'append' or 'replace'"}
+
+
+def tool_update_brief(args: dict) -> dict:
+    """Append a feedback block to a specific campaign's brief, OR replace it
+    entirely. Writes data/campaigns/<campaign_name>/brief.md.
+
+    Use this when the user gives feedback that's specific to ONE campaign's
+    angle, hook, or red lines (e.g. "for direct-value-A, drop the 14-day
+    sprint mention"). For feedback that applies to ALL campaigns, use
+    update_voice_rules instead.
+    """
+    name = args["campaign_name"]
+    bp = REPO_ROOT / "data" / "campaigns" / name / "brief.md"
+    if not bp.parent.exists():
+        return {"error": f"no campaign at {bp.parent.relative_to(REPO_ROOT)}"}
+
+    if "replace" in args:
+        bp.write_text(args["replace"])
+        return {"updated": True, "mode": "replace", "campaign_name": name,
+                  "chars": len(args["replace"])}
+    if "append" in args:
+        existing = bp.read_text() if bp.exists() else ""
+        block = (
+            f"\n\n## Update — {dt.datetime.utcnow().date().isoformat()}\n\n"
+            + args["append"]
+        )
+        bp.write_text(existing + block)
+        return {"updated": True, "mode": "append", "campaign_name": name,
+                  "appended_chars": len(args["append"])}
+    return {"error": "supply either 'append' or 'replace'"}
+
+
 def tool_log_capability_gap(args: dict) -> dict:
     """Append a row to data/skill_gaps.jsonl when the user asks for something
     the agent has no tool for. Call this BEFORE telling the user you can't
@@ -590,6 +650,21 @@ TOOLS = [
      "description": "Flip a Smartlead campaign from DRAFTED to ACTIVE (start sending). Smartlead's existing schedule (hours, daily cap) on the campaign is respected — this just flips the on switch. DESTRUCTIVE — only call after explicit user confirm AND only after preview_emails has been shown.",
      "input_schema": {"type": "object", "required": ["campaign_id"],
                        "properties": {"campaign_id": {"type": ["string", "integer"]}}}},
+    {"name": "update_voice_rules",
+     "description": "Append or replace Justin's global voice rules (data/voice_rules.md). The Copy squad loads these on top of every campaign brief — changes propagate to the next preview / launch. Use when the user gives feedback that applies across ALL campaigns ('stop saying X', 'voice should be Y'). Use update_brief instead for feedback that's specific to ONE campaign.",
+     "input_schema": {"type": "object",
+                       "properties": {
+                           "append": {"type": "string",
+                              "description": "Markdown block to append to the rules. Preserves existing rules and adds dated section."},
+                           "replace": {"type": "string",
+                              "description": "Full replacement of voice_rules.md. Use sparingly."}}}},
+    {"name": "update_brief",
+     "description": "Append or replace a specific campaign's brief at data/campaigns/<name>/brief.md. Use for feedback that's specific to ONE campaign's angle, hook, or red lines (e.g. 'for direct-value-A specifically, drop the 14-day mention'). For cross-campaign feedback, use update_voice_rules.",
+     "input_schema": {"type": "object", "required": ["campaign_name"],
+                       "properties": {
+                           "campaign_name": {"type": "string"},
+                           "append": {"type": "string"},
+                           "replace": {"type": "string"}}}},
     {"name": "log_capability_gap",
      "description": "Call this BEFORE telling the user 'I can't do that'. Logs a row to data/skill_gaps.jsonl so recurring gaps surface as the next tools to build. After calling, give the user a clean answer about what you can do as an alternative.",
      "input_schema": {"type": "object", "required": ["user_request", "missing_tool_name"],
@@ -627,6 +702,8 @@ TOOL_FUNCS = {
     "preview_emails": tool_preview_emails,
     "generate_preview_pack": tool_generate_preview_pack,
     "schedule_campaign": tool_schedule_campaign,
+    "update_voice_rules": tool_update_voice_rules,
+    "update_brief": tool_update_brief,
     "log_capability_gap": tool_log_capability_gap,
     "archive_campaign": tool_archive_campaign,
     "precreate_campaigns": tool_precreate_campaigns,
@@ -674,6 +751,7 @@ after `launch_pilot` runs and after you call `preview_emails`.
 8. **Stats / list / read / preview**: call freely without confirmation — they're read-only or near-read-only.
 9. **Show examples / preview copy**: when the user says "show me examples", "preview the copy", "what would the emails look like" → call `generate_preview_pack` with the source Smartlead campaign ID and the target campaign names. It runs Research + Copy WITHOUT writing to Smartlead, posts samples to this thread. Confirm the user wants to proceed before each `launch_pilot` after they've reviewed.
 10. **Capability gaps**: when a request would require a tool you don't have, FIRST call `log_capability_gap` with what was asked + what tool would help. THEN tell the user what you can do as an alternative. This is how the system learns over time — every gap becomes a candidate for the next tool to build.
+11. **Feedback on copy / voice / rules (CRITICAL — DO THE WORK)**: when the user gives feedback like "stop saying X", "the voice should be Y", "for campaign Z drop W" — DO NOT just acknowledge what you'll change. Actually call `update_voice_rules` (for cross-campaign feedback) and/or `update_brief` (for one-campaign feedback) RIGHT THEN. Then call `generate_preview_pack` to regenerate samples. Then post the new samples to the thread. The full sequence in ONE turn: (a) update voice rules / briefs, (b) confirm what was written, (c) re-run preview pack. Never end a turn after just summarizing the user's feedback — that wastes their time.
 
 # Confirmation gate (CRITICAL)
 
