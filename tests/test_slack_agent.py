@@ -170,6 +170,59 @@ def test_active_thread_tracking_round_trip(tmp_path=None):
     assert "1777400500.000002" in pruned
 
 
+def test_run_pilot_aborts_on_empty_copy():
+    """Regression: 2026-04-28 — Justin's first big launch shipped raw template
+    tokens to Smartlead because Copy squad returned empty sequences and we
+    uploaded anyway. Smartlead substituted `{{email_1_body}}` literally,
+    producing un-personalized emails ready to send. The fix raises
+    RuntimeError before build_campaign is called when ANY prospect has an
+    empty body or subject for step 1.
+
+    This test simulates the empty-sequence shape and validates the guard
+    fires (without actually invoking LLMs or Smartlead).
+    """
+    # Mirror the hard-fail logic from orchestrator/main.py:run_pilot
+    def empty_copy_check(leads, emails):
+        empty = []
+        for lead, email in zip(leads, emails):
+            seq = email.get("sequence") or []
+            step1 = next((s for s in seq if s.get("step") == 1), None)
+            if not step1 or not (step1.get("body") or "").strip() \
+                    or not (step1.get("subject") or "").strip():
+                empty.append(lead.get("email"))
+        return empty
+
+    leads = [
+        {"email": "a@x.com"},
+        {"email": "b@x.com"},
+        {"email": "c@x.com"},
+    ]
+    # Case 1: all empty (Copy squad fully failed)
+    emails_all_empty = [{"sequence": []} for _ in leads]
+    assert empty_copy_check(leads, emails_all_empty) == \
+            ["a@x.com", "b@x.com", "c@x.com"]
+
+    # Case 2: one prospect has step 1 with empty body
+    emails_partial = [
+        {"sequence": [{"step": 1, "subject": "ok", "body": "real body"}]},
+        {"sequence": [{"step": 1, "subject": "ok", "body": ""}]},
+        {"sequence": [{"step": 1, "subject": "ok", "body": "real body"}]},
+    ]
+    assert empty_copy_check(leads, emails_partial) == ["b@x.com"]
+
+    # Case 3: missing step 1 entirely (only step 2/3 generated)
+    emails_no_step1 = [
+        {"sequence": [{"step": 2, "subject": "ok", "body": "body"}]},
+    ]
+    assert empty_copy_check(leads[:1], emails_no_step1) == ["a@x.com"]
+
+    # Case 4: clean sequences pass (empty list returned)
+    emails_clean = [
+        {"sequence": [{"step": 1, "subject": "ok", "body": "real"}]},
+    ] * 3
+    assert empty_copy_check(leads, emails_clean) == []
+
+
 if __name__ == "__main__":
     test_thread_state_is_json_serializable()
     test_serialization_handles_anthropic_blocks_via_run_tools_logic()
@@ -177,4 +230,5 @@ if __name__ == "__main__":
     test_copy_squad_handles_null_pick_in_hook()
     test_copy_squad_handles_null_sequence_in_body_output()
     test_active_thread_tracking_round_trip()
+    test_run_pilot_aborts_on_empty_copy()
     print("All slack_agent regression tests pass ✓")

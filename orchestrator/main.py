@@ -100,25 +100,65 @@ async def run_pilot(
     campaign_name_override: str | None = None,
     source_label: str = "csv",
     dry_run: bool = False,
-) -> int:
+    progress_cb=None,
+) -> dict:
     """Strategy → Research → Copy → Smartlead. Niche-aware, variant-aware, idempotent.
 
     leads is a pre-loaded list[Lead] — caller decides CSV vs Prospector vs other source.
+
+    Returns a dict (NOT exit code) with the run_log + counts so callers can
+    surface real numbers in Slack. Raises on hard failure — caller posts ❌.
+
+    `progress_cb` is an optional callable `cb(stage: str, done: int, total: int,
+                                                detail: str)` invoked at milestones
+    so long pilots can post progress (e.g., "research 200/698 done").
+
+    Concurrency tunables via env:
+      CE2_RESEARCH_PARALLEL (default 30)
+      CE2_COPY_PARALLEL     (default 20)
     """
     from squads.smartlead.squad import make_campaign_name
     campaign_name = campaign_name_override or make_campaign_name(niche, offer, variant)
+    n = len(leads)
 
-    _say(f"=== Cold Email 2.0 — pilot: {campaign_name} ({len(leads)} leads from {source_label}) ===")
+    # Per-pilot structured log — append-only JSONL we can grep when something
+    # goes wrong. Path: data/pilots/<campaign>-<ts>.jsonl.
+    pilots_dir = REPO_ROOT / "data" / "pilots"
+    pilots_dir.mkdir(parents=True, exist_ok=True)
+    run_id = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    pilot_log_path = pilots_dir / f"{campaign_name}-{run_id}.jsonl"
+
+    def _logp(event: str, **kw):
+        rec = {"ts": dt.datetime.utcnow().isoformat() + "Z", "event": event,
+                "campaign": campaign_name, **kw}
+        try:
+            with pilot_log_path.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass  # never let logging break the pilot
+
+    def _progress(stage: str, done: int, total: int, detail: str = ""):
+        if progress_cb:
+            try:
+                progress_cb(stage, done, total, detail)
+            except Exception as e:
+                print(f"[run_pilot] progress_cb failed (suppressed): {e}", flush=True)
+
+    _logp("pilot_start", leads=n, source=source_label, niche=niche,
+           offer=offer, variant=variant)
+    _say(f"=== Cold Email 2.0 — pilot: {campaign_name} ({n} leads from {source_label}) ===")
+    _say(f"=== run_id={run_id}  log={pilot_log_path.relative_to(REPO_ROOT)} ===")
     if not leads:
         _say("no leads to process — exiting")
-        return 0
+        _logp("pilot_abort", reason="no_leads")
+        return {"campaign_name": campaign_name, "leads_in_this_run": 0, "aborted": True}
 
     summary = lead_summary(leads)
     _say("--- Lead summary ---\n" + summary)
 
     if dry_run:
         _say("\n[dry-run] skipping LLM stages and Smartlead writes. Lead loading verified.")
-        return 0
+        return {"campaign_name": campaign_name, "leads_in_this_run": 0, "dry_run": True}
 
     # 1. Strategy squad → brief (cached per <campaign_name>)
     brief_dir = REPO_ROOT / "data" / "campaigns" / campaign_name
@@ -127,54 +167,133 @@ async def run_pilot(
     if brief_path.exists():
         _say(f"\nStage 1/4: Strategy — reusing cached brief at {brief_path.relative_to(REPO_ROOT)}")
         brief = brief_path.read_text()
+        _logp("strategy_cached", chars=len(brief))
     else:
         _say(f"\nStage 1/4: Strategy (Opus, ~30s) — generating brief for {campaign_name}")
+        _logp("strategy_start")
         strategy = StrategySquad()
         brief = await strategy.build_brief(offer, summary, niche=niche, variant=variant)
         brief_path.write_text(brief)
         _say(f"✓ campaign brief → {brief_path.relative_to(REPO_ROOT)} ({len(brief)} chars)")
+        _logp("strategy_done", chars=len(brief))
 
     # 2. Research squad → per-prospect signals (parallel)
-    _say(f"\nStage 2/4: Research (Haiku × {len(leads)} parallel)")
+    research_parallel = int(os.environ.get("CE2_RESEARCH_PARALLEL", "30"))
+    _say(f"\nStage 2/4: Research (Haiku × {n} leads, max_parallel={research_parallel})")
+    _logp("research_start", parallel=research_parallel)
+    _progress("research", 0, n, f"max_parallel={research_parallel}")
     research = ResearchSquad(brief=brief)
-    signals = await research.research_batch(leads, max_parallel=10)
+    research_t0 = dt.datetime.utcnow()
+    signals = await research.research_batch(leads, max_parallel=research_parallel)
+    research_dt = (dt.datetime.utcnow() - research_t0).total_seconds()
     tier_counts: dict[str, int] = {}
     for s in signals:
         tier_counts[s.get("tier", "?")] = tier_counts.get(s.get("tier", "?"), 0) + 1
     tier_str = ", ".join(f"{t}={n}" for t, n in sorted(tier_counts.items()))
-    _say(f"  signal tiers: {tier_str}")
+    _say(f"  signal tiers: {tier_str}  (took {research_dt:.0f}s, "
+          f"{research_dt/max(n,1):.2f}s/lead)")
+    _logp("research_done", duration_seconds=round(research_dt, 1),
+           tiers=tier_counts)
+    _progress("research", n, n, f"{research_dt:.0f}s · {tier_str}")
 
     # 3. Copy squad → per-prospect sequences
-    _say(f"\nStage 3/4: Copy (Sonnet hook + Haiku body × {len(leads)})")
+    copy_parallel = int(os.environ.get("CE2_COPY_PARALLEL", "20"))
+    _say(f"\nStage 3/4: Copy (Sonnet hook + Haiku body × {n}, max_parallel={copy_parallel})")
+    _logp("copy_start", parallel=copy_parallel)
+    _progress("copy", 0, n, f"max_parallel={copy_parallel}")
     copy = CopySquad(brief=brief)
-    sem = asyncio.Semaphore(8)
+    sem = asyncio.Semaphore(copy_parallel)
+    copy_done_counter = {"n": 0}
+    last_progress = {"t": dt.datetime.utcnow()}
 
     async def write_one(lead: Lead, signal: dict):
         async with sem:
-            return await copy.write_one(lead, signal)
+            try:
+                result = await copy.write_one(lead, signal)
+            except Exception as e:
+                # Never let one prospect's crash kill the batch — record it.
+                _logp("copy_lead_error", email=lead.email, error=str(e)[:200])
+                return {"sequence": [], "slop_pass": False, "error": str(e)}
+            copy_done_counter["n"] += 1
+            # Throttled progress: every 25 leads OR every 30 seconds
+            now = dt.datetime.utcnow()
+            if (copy_done_counter["n"] % 25 == 0 or
+                    (now - last_progress["t"]).total_seconds() > 30):
+                _progress("copy", copy_done_counter["n"], n, "")
+                last_progress["t"] = now
+            return result
 
-    emails = await asyncio.gather(*(write_one(lead, sig) for lead, sig in zip(leads, signals)))
+    copy_t0 = dt.datetime.utcnow()
+    emails = await asyncio.gather(*(write_one(lead, sig)
+                                       for lead, sig in zip(leads, signals)))
+    copy_dt = (dt.datetime.utcnow() - copy_t0).total_seconds()
     slop_pass = sum(1 for e in emails if e.get("slop_pass"))
-    _say(f"✓ {slop_pass}/{len(emails)} sequences passed slop critic")
+    _say(f"✓ {slop_pass}/{len(emails)} sequences passed slop critic "
+          f"(took {copy_dt:.0f}s, {copy_dt/max(n,1):.2f}s/lead)")
+    _logp("copy_done", duration_seconds=round(copy_dt, 1),
+           slop_pass=slop_pass, total=len(emails))
+    _progress("copy", n, n, f"{copy_dt:.0f}s · {slop_pass}/{n} slop-clean")
+
+    # 3b. HARD FAIL on empty copy. This is the bug Justin called out:
+    # "the big list was not personalized at all" — Smartlead substitutes
+    # `{{email_1_body}}` literally if custom_fields is empty. Better to abort
+    # the whole batch than ship raw template tokens to thousands of leads.
+    empty = []
+    for lead, email in zip(leads, emails):
+        seq = email.get("sequence") or []
+        # Need at least step 1 with a non-empty body. Step 2/3 follow same path
+        # so if step 1 is missing, the whole prospect is broken.
+        step1 = next((s for s in seq if s.get("step") == 1), None)
+        if not step1 or not (step1.get("body") or "").strip() \
+                or not (step1.get("subject") or "").strip():
+            empty.append(lead.email)
+    empty_pct = 100.0 * len(empty) / max(n, 1)
+    _logp("empty_copy_check", empty=len(empty), total=n,
+           empty_pct=round(empty_pct, 1),
+           sample_emails=empty[:5])
+    if empty:
+        msg = (f"Copy squad produced {len(empty)}/{n} ({empty_pct:.1f}%) "
+                f"empty sequences. Refusing to upload to Smartlead — would ship "
+                f"raw `{{{{email_1_body}}}}` tokens. First 5 broken leads: "
+                f"{empty[:5]}. See {pilot_log_path.relative_to(REPO_ROOT)}.")
+        _say(f"\n✗ {msg}")
+        raise RuntimeError(msg)
 
     # 4. Smartlead squad → DRAFTED campaign (lookup-or-create + append leads)
-    _say(f"\nStage 4/4: Smartlead (lookup-or-create '{campaign_name}', append {len(leads)} leads)")
+    _say(f"\nStage 4/4: Smartlead (lookup-or-create '{campaign_name}', append {n} leads)")
+    _logp("smartlead_start")
+    _progress("smartlead", 0, n, "uploading...")
     sl = SmartleadSquad()
     leads_with_emails = [
         {"lead": lead.__dict__, "emails": email}
         for lead, email in zip(leads, emails)
     ]
+    sl_t0 = dt.datetime.utcnow()
     run_log = sl.build_campaign(offer, leads_with_emails, niche=niche, variant=variant,
                                   campaign_name_override=campaign_name_override)
+    sl_dt = (dt.datetime.utcnow() - sl_t0).total_seconds()
+    _logp("smartlead_done", duration_seconds=round(sl_dt, 1),
+           campaign_id=run_log.get("campaign_id"),
+           created_now=run_log.get("created_now"))
+    _progress("smartlead", n, n, f"{sl_dt:.0f}s")
     _say("--- Smartlead campaign ---\n" + json.dumps(run_log, indent=2))
 
+    total_dt = (dt.datetime.utcnow() - research_t0).total_seconds()
     _say(
-        f"\n=== Pilot complete ===\n"
+        f"\n=== Pilot complete ({total_dt:.0f}s total) ===\n"
         f"Campaign '{campaign_name}' "
         f"{'CREATED' if run_log.get('created_now') else 'APPENDED-TO'} in DRAFTED state.\n"
+        f"  Research: {research_dt:.0f}s · Copy: {copy_dt:.0f}s · Smartlead: {sl_dt:.0f}s\n"
+        f"  Empty copies: 0/{n} (hard-fail check passed)\n"
         f"Inspect data/emails/*.json + Smartlead UI before resuming.\n"
     )
-    return 0
+    _logp("pilot_done", total_seconds=round(total_dt, 1))
+    return {**run_log, "research_seconds": round(research_dt, 1),
+            "copy_seconds": round(copy_dt, 1),
+            "smartlead_seconds": round(sl_dt, 1),
+            "total_seconds": round(total_dt, 1),
+            "slop_pass": slop_pass,
+            "pilot_log": str(pilot_log_path.relative_to(REPO_ROOT))}
 
 
 def cli() -> int:
@@ -270,12 +389,11 @@ def cli() -> int:
     if args.max:
         leads = leads[:args.max]
 
-    return asyncio.run(run_pilot(args.offer, leads,
-                                    niche=args.niche, variant=args.variant,
-                                    campaign_name_override=args.campaign_name,
-                                    source_label=source_label, dry_run=args.dry_run))
-
-    return asyncio.run(run_pilot(args.angle, Path(args.leads), max_leads=args.max))
+    asyncio.run(run_pilot(args.offer, leads,
+                              niche=args.niche, variant=args.variant,
+                              campaign_name_override=args.campaign_name,
+                              source_label=source_label, dry_run=args.dry_run))
+    return 0
 
 
 if __name__ == "__main__":

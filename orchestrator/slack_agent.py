@@ -249,7 +249,18 @@ def tool_prospect_fetch_confirmed(args: dict) -> dict:
 
 
 def tool_launch_pilot(args: dict) -> dict:
-    """Spawn run_pilot as a background task. Returns immediately with task id."""
+    """Spawn run_pilot as a background task. Returns immediately with task id.
+
+    Three reliability fixes from 2026-04-28:
+    1. `done_callback` reads `task.exception()` so silent crashes get posted.
+       Previously a TypeError or import error before the inner try inside the
+       coroutine would simply vanish.
+    2. Throttled progress posts to Slack ("research 250/698 done · 12s/100")
+       so a 30-min run isn't a black hole.
+    3. Hard-fail in run_pilot raises if Copy produced empty sequences;
+       this catches it and posts ❌ with the diagnostic instead of pretending
+       the upload succeeded.
+    """
     from orchestrator.main import run_pilot
     handle = args["lead_handle"]
     niche = args.get("niche")
@@ -259,30 +270,97 @@ def tool_launch_pilot(args: dict) -> dict:
         return {"error": f"unknown lead_handle '{handle}' — call ingest or fetch first"}
     leads = LEAD_HANDLES[handle]["leads"]
     source = LEAD_HANDLES[handle]["source"]
+    campaign_label = f"{niche}-{offer}-{variant.upper()}"
 
-    # Spawn background task; deliver result via Slack from within the task.
     sc = SlackClient()
     channel = os.environ.get("SLACK_CONTROL_CHANNEL", "#cold-email-control")
     thread_ts = args.get("_thread_ts")  # injected by run_tools
 
-    async def _runner():
+    # Throttled progress callback — only posts at meaningful milestones so we
+    # don't spam Slack but the user can see it's alive. Stage transitions and
+    # "every 100 leads" within copy.
+    last_msg = {"key": ""}
+    def progress_cb(stage: str, done: int, total: int, detail: str):
+        # Only post on stage transitions or every 100 within copy. The first
+        # call for each stage (done=0) marks the transition.
+        key = f"{stage}:{done // 100}" if stage == "copy" else f"{stage}:{done}/{total}"
+        if key == last_msg["key"]:
+            return
+        last_msg["key"] = key
+        msg = (f":hourglass_flowing_sand: `{campaign_label}` · "
+                f"*{stage}* {done}/{total}" +
+                (f" · {detail}" if detail else ""))
         try:
-            await run_pilot(offer, leads, niche=niche, variant=variant,
-                              source_label=source, dry_run=False)
-            sc.post(channel, f":white_check_mark: pilot complete — "
-                              f"`{niche}-{offer}-{variant.upper()}` "
-                              f"({len(leads)} leads from {source})",
-                     thread_ts=thread_ts)
+            sc.post(channel, msg, thread_ts=thread_ts)
         except Exception as e:
-            sc.post(channel, f":x: pilot failed for "
-                              f"`{niche}-{offer}-{variant.upper()}`: {e}",
+            print(f"[launch_pilot] progress post failed: {e}", flush=True)
+
+    async def _runner():
+        result = await run_pilot(offer, leads, niche=niche, variant=variant,
+                                    source_label=source, dry_run=False,
+                                    progress_cb=progress_cb)
+        # Post full success summary with real numbers — not the old vague
+        # "pilot complete" line.
+        total = result.get("total_seconds", 0)
+        camp_id = result.get("campaign_id", "?")
+        leads_in = result.get("leads_in_this_run", len(leads))
+        slop = result.get("slop_pass", "?")
+        sc.post(channel,
+                  f":white_check_mark: *pilot complete* — `{campaign_label}` "
+                  f"(id `{camp_id}`)\n"
+                  f"  • {leads_in} leads from {source}\n"
+                  f"  • Slop-clean: {slop}/{leads_in}\n"
+                  f"  • Research {result.get('research_seconds', 0):.0f}s · "
+                  f"Copy {result.get('copy_seconds', 0):.0f}s · "
+                  f"Smartlead {result.get('smartlead_seconds', 0):.0f}s · "
+                  f"*total {total:.0f}s*\n"
+                  f"  • Log: `{result.get('pilot_log', '?')}`",
+                  thread_ts=thread_ts)
+        return result
+
+    def _on_done(task: asyncio.Task):
+        """Critical: post traceback to Slack on ANY exception, including the
+        ones that the inner try-except in _runner would have missed (cancellation,
+        import errors, etc.). This is the bug Justin hit — three pilots launched,
+        zero completion messages, zero errors anywhere."""
+        if task.cancelled():
+            sc.post(channel, f":x: `{campaign_label}` pilot was *cancelled*",
                      thread_ts=thread_ts)
+            return
+        exc = task.exception()
+        if exc is None:
+            return  # success path already posted
+        import traceback as tb
+        err = "".join(tb.format_exception(type(exc), exc, exc.__traceback__))
+        # Trim to last ~1500 chars so it fits in a Slack message
+        tail = err[-1500:] if len(err) > 1500 else err
+        try:
+            sc.post(channel,
+                      f":x: *pilot FAILED* — `{campaign_label}`\n"
+                      f"```\n{tail}\n```",
+                      thread_ts=thread_ts)
+        except Exception as post_e:
+            print(f"[launch_pilot] failed to post error: {post_e}\n"
+                   f"original error: {err}", flush=True)
+        # also dump to disk so we have it forever
+        try:
+            crash_dir = REPO_ROOT / "data" / "pilots"
+            crash_dir.mkdir(parents=True, exist_ok=True)
+            (crash_dir / f"CRASH-{campaign_label}-"
+                f"{dt.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.txt"
+            ).write_text(err)
+        except Exception:
+            pass
 
     task_id = _new_handle("pilot")
-    RUNNING_PILOTS[task_id] = asyncio.create_task(_runner())
+    task = asyncio.create_task(_runner())
+    task.add_done_callback(_on_done)
+    RUNNING_PILOTS[task_id] = task
     return {"started": True, "task_id": task_id, "leads": len(leads),
-            "campaign": f"{niche}-{offer}-{variant.upper()}",
-            "note": "Running in background. I will message this thread when done (~2-5 min)."}
+            "campaign": campaign_label,
+            "note": ("Running in background. Progress will post to this thread "
+                       "(stage transitions + every 100 leads). I will post a final "
+                       "✅ or ❌ when done.")}
 
 
 def tool_load_leads_from_smartlead(args: dict) -> dict:
