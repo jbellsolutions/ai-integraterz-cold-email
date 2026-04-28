@@ -86,19 +86,42 @@ class SmartleadCLI:
                               all_pages: bool = True) -> list[dict]:
         """Pull leads attached to an existing Smartlead campaign.
 
-        all_pages=True uses --all and ignores limit. Useful when you want every
-        lead the campaign has (e.g. taking an existing recruiter list and
-        re-targeting it with new copy).
+        Note: the CLI's --all flag is broken (returns []), so we paginate
+        manually when all_pages=True. Each page is up to 100 leads.
         """
         if _mock_enabled():
             return []
-        args = ["leads", "list", "--campaign-id", str(campaign_id)]
-        if all_pages:
-            args.append("--all")
-        else:
-            args.extend(["--limit", str(limit)])
-        out = self._run_json(args)
-        return out if isinstance(out, list) else out.get("data", []) or []
+
+        def _fetch_page(offset: int, page_limit: int) -> tuple[list[dict], int]:
+            args = ["leads", "list", "--campaign-id", str(campaign_id),
+                    "--limit", str(page_limit), "--offset", str(offset)]
+            out = self._run_json(args)
+            if isinstance(out, list):
+                return out, 0
+            data = out.get("data", []) or []
+            total = int(out.get("total_leads") or out.get("total") or 0)
+            return data, total
+
+        if not all_pages:
+            data, _ = _fetch_page(0, min(limit, 100))
+            return data
+
+        all_data: list[dict] = []
+        offset = 0
+        page_size = 100
+        while True:
+            page, total = _fetch_page(offset, page_size)
+            if not page:
+                break
+            all_data.extend(page)
+            if total and len(all_data) >= total:
+                break
+            if len(page) < page_size:
+                break
+            offset += page_size
+            if offset > 5000:  # safety
+                break
+        return all_data
 
     def delete_campaign(self, campaign_id: int | str) -> dict:
         if _mock_enabled():

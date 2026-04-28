@@ -150,13 +150,20 @@ def load_leads_from_campaign(campaign_id: int | str, max_n: int | None = None,
             continue
         first = l.get("first_name") or l.get("firstName") or ""
         last = l.get("last_name") or l.get("lastName") or ""
+        # Title can be at the top level OR nested in custom_fields.job_title.
+        # Smartlead Prospector imports put it under custom_fields; manual CSV
+        # uploads put it at the top. Check both.
+        cf = l.get("custom_fields") or {}
+        title = (l.get("title") or l.get("job_title")
+                  or cf.get("job_title") or cf.get("title") or "")
         leads.append(Lead(
             lead_id=email,
             name=f"{first} {last}".strip() or email,
             email=email,
             company=l.get("company_name") or l.get("company") or "",
-            title=l.get("title") or l.get("job_title") or "",
-            linkedin_url=l.get("linkedin_url") or l.get("linkedin") or "",
+            title=title,
+            linkedin_url=(l.get("linkedin_url") or l.get("linkedin")
+                            or cf.get("linkedin_url") or ""),
         ))
     return leads
 
