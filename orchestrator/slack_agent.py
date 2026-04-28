@@ -350,6 +350,140 @@ def tool_schedule_campaign(args: dict) -> dict:
     return {"campaign_id": cid, "new_status": "START", "result": result}
 
 
+def tool_generate_preview_pack(args: dict) -> dict:
+    """Generate sample emails for one or more pre-created campaigns WITHOUT
+    writing anything to Smartlead. Pulls a small lead sample (default 3) from
+    a source Smartlead campaign, runs them through Research + Copy with each
+    target's cached brief, and returns the rendered subjects + bodies.
+
+    Use this BEFORE launch_pilot when the user wants to "see examples" or
+    "preview the copy" for the pre-created campaigns. Cheap (~$0.30 per
+    target × N leads), takes ~60-90 seconds per target.
+
+    args:
+      source_campaign_id: int|str — Smartlead campaign holding the recruiter list
+      targets:           list[str] — campaign names to generate previews for,
+                          e.g. ["recruiters-power-partner-A","recruiters-power-partner-B"]
+      n:                 int — leads to sample (default 3)
+    """
+    import asyncio as _asyncio
+    from squads.copy import CopySquad
+    from squads.research import ResearchSquad
+    from tools.lead_loader import load_leads_from_campaign
+
+    source_id = args["source_campaign_id"]
+    targets = args["targets"]
+    if isinstance(targets, str):
+        targets = [t.strip() for t in targets.split(",") if t.strip()]
+    n = int(args.get("n", 3))
+
+    sc = SlackClient()
+    channel = os.environ.get("SLACK_CONTROL_CHANNEL", "#cold-email-control")
+    thread_ts = args.get("_thread_ts")
+
+    async def _runner():
+        # 1. Pull leads ONCE (cheap, no copies in pipeline)
+        all_leads = load_leads_from_campaign(source_id, max_n=max(n, 5))
+        if not all_leads:
+            sc.post(channel, f":x: Source Smartlead campaign `{source_id}` has no leads.",
+                     thread_ts=thread_ts)
+            return
+        leads = all_leads[:n]
+        sc.post(channel,
+                 f":hourglass_flowing_sand: Generating previews for {len(targets)} campaigns "
+                 f"× {len(leads)} leads each. Source: campaign `{source_id}`.",
+                 thread_ts=thread_ts)
+
+        for target in targets:
+            try:
+                brief_path = REPO_ROOT / "data" / "campaigns" / target / "brief.md"
+                if not brief_path.exists():
+                    sc.post(channel,
+                             f":warning: `{target}` has no cached brief — skipping. "
+                             f"Run `precreate_campaigns` first.", thread_ts=thread_ts)
+                    continue
+                brief = brief_path.read_text()
+
+                research = ResearchSquad(brief=brief)
+                signals = await research.research_batch(leads, max_parallel=len(leads))
+
+                copy = CopySquad(brief=brief)
+                emails_out = []
+                for lead, sig in zip(leads, signals):
+                    emails_out.append(await copy.write_one(lead, sig))
+
+                # Render to Slack mrkdwn — one block per lead
+                lines = [f"*:envelope: {target}* — {len(emails_out)} sample(s)"]
+                for lead, em in zip(leads, emails_out):
+                    seq = (em.get("sequence") or [])
+                    slop = ":white_check_mark:" if em.get("slop_pass") else ":warning: slop"
+                    lines.append(f"\n———\n*{lead.name}* — {lead.title} @ {lead.company}  {slop}")
+                    for step in seq:
+                        si = step.get("step", "?")
+                        subj = step.get("subject", "")
+                        body = step.get("body", "")
+                        lines.append(f"\n*Email {si}* — `{subj}`\n```\n{body[:1200]}\n```")
+                # Slack hard caps message at 40k; chunk if needed
+                msg = "\n".join(lines)
+                for chunk in _slack_chunk(msg, 3500):
+                    sc.post(channel, chunk, thread_ts=thread_ts)
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"[generate_preview_pack] {target} failed: {tb}", flush=True)
+                sc.post(channel, f":x: `{target}` preview failed: {type(e).__name__}: {e}",
+                         thread_ts=thread_ts)
+
+        sc.post(channel,
+                 f":white_check_mark: Preview pack done. Reply *approve* to proceed with "
+                 f"a full `launch_pilot` to those campaigns, or tell me what to change.",
+                 thread_ts=thread_ts)
+
+    task_id = _new_handle("preview")
+    RUNNING_PILOTS[task_id] = asyncio.create_task(_runner())
+    return {"started": True, "task_id": task_id, "targets": targets, "n": n,
+            "note": "Running in background. I will post each campaign's samples in this thread as they complete (~60-90s each)."}
+
+
+def _slack_chunk(text: str, limit: int = 3500) -> list[str]:
+    """Split a long Slack message at line breaks to stay under message limits."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > limit:
+            if cur:
+                chunks.append(cur)
+            cur = line
+        else:
+            cur = (cur + "\n" + line) if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def tool_log_capability_gap(args: dict) -> dict:
+    """Append a row to data/skill_gaps.jsonl when the user asks for something
+    the agent has no tool for. Call this BEFORE telling the user you can't
+    do it — that way we get a logged backlog of features to build.
+
+    Justin reviews data/skill_gaps.jsonl periodically; recurring gaps become
+    the next tools in the registry.
+    """
+    gap_file = REPO_ROOT / "data" / "skill_gaps.jsonl"
+    gap_file.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "logged_at": dt.datetime.utcnow().isoformat(),
+        "user_request": args.get("user_request", ""),
+        "missing_tool_name": args.get("missing_tool_name", ""),
+        "what_it_would_do": args.get("what_it_would_do", ""),
+        "workaround_used": args.get("workaround_used", ""),
+    }
+    with gap_file.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    return {"logged": True, "file": str(gap_file.relative_to(REPO_ROOT))}
+
+
 def tool_archive_campaign(args: dict) -> dict:
     from tools.smartlead import SmartleadCLI
     cid = args["campaign_id"]
@@ -441,10 +575,29 @@ TOOLS = [
                            "n": {"type": "integer", "default": 5},
                            "step": {"type": "integer",
                               "description": "1, 2, or 3 — restrict to one sequence step (default: all 3)"}}}},
+    {"name": "generate_preview_pack",
+     "description": "Generate sample emails for a SET of campaigns WITHOUT writing to Smartlead. Pulls n leads from a source Smartlead campaign, runs Research + Copy with each target's cached brief, posts the rendered subjects+bodies to this Slack thread. Use when the user says 'show me examples', 'preview the copy', or 'what would the emails look like'. Costs ~$0.30 × n × len(targets), takes ~60-90s per target.",
+     "input_schema": {"type": "object",
+                       "required": ["source_campaign_id", "targets"],
+                       "properties": {
+                           "source_campaign_id": {"type": ["string", "integer"],
+                              "description": "Smartlead campaign ID holding the source leads"},
+                           "targets": {"type": "array", "items": {"type": "string"},
+                              "description": "list of campaign names, e.g. ['recruiters-power-partner-A','recruiters-direct-value-A']"},
+                           "n": {"type": "integer", "default": 3,
+                              "description": "leads to sample per target (default 3)"}}}},
     {"name": "schedule_campaign",
      "description": "Flip a Smartlead campaign from DRAFTED to ACTIVE (start sending). Smartlead's existing schedule (hours, daily cap) on the campaign is respected — this just flips the on switch. DESTRUCTIVE — only call after explicit user confirm AND only after preview_emails has been shown.",
      "input_schema": {"type": "object", "required": ["campaign_id"],
                        "properties": {"campaign_id": {"type": ["string", "integer"]}}}},
+    {"name": "log_capability_gap",
+     "description": "Call this BEFORE telling the user 'I can't do that'. Logs a row to data/skill_gaps.jsonl so recurring gaps surface as the next tools to build. After calling, give the user a clean answer about what you can do as an alternative.",
+     "input_schema": {"type": "object", "required": ["user_request", "missing_tool_name"],
+                       "properties": {
+                           "user_request": {"type": "string"},
+                           "missing_tool_name": {"type": "string"},
+                           "what_it_would_do": {"type": "string"},
+                           "workaround_used": {"type": "string"}}}},
     {"name": "archive_campaign",
      "description": "Stop or delete a Smartlead campaign. Destructive — only call after explicit user yes.",
      "input_schema": {"type": "object", "required": ["campaign_id"],
@@ -472,7 +625,9 @@ TOOL_FUNCS = {
     "launch_pilot": tool_launch_pilot,
     "load_leads_from_smartlead": tool_load_leads_from_smartlead,
     "preview_emails": tool_preview_emails,
+    "generate_preview_pack": tool_generate_preview_pack,
     "schedule_campaign": tool_schedule_campaign,
+    "log_capability_gap": tool_log_capability_gap,
     "archive_campaign": tool_archive_campaign,
     "precreate_campaigns": tool_precreate_campaigns,
 }
@@ -517,6 +672,8 @@ after `launch_pilot` runs and after you call `preview_emails`.
 6. **Show samples (CRITICAL)**: After every `launch_pilot` completes, AUTOMATICALLY call `preview_emails` for each campaign that received leads, and post 3-5 examples in the thread. The user must always see real generated copy before any campaign moves to ACTIVE.
 7. **Schedule (start sending)**: only after the user has reviewed previews and explicitly approved with words like "looks good, start it" or "send" or "schedule". Then call `schedule_campaign` with the campaign_id. The Smartlead UI's pre-configured schedule (sending hours, daily cap) is respected.
 8. **Stats / list / read / preview**: call freely without confirmation — they're read-only or near-read-only.
+9. **Show examples / preview copy**: when the user says "show me examples", "preview the copy", "what would the emails look like" → call `generate_preview_pack` with the source Smartlead campaign ID and the target campaign names. It runs Research + Copy WITHOUT writing to Smartlead, posts samples to this thread. Confirm the user wants to proceed before each `launch_pilot` after they've reviewed.
+10. **Capability gaps**: when a request would require a tool you don't have, FIRST call `log_capability_gap` with what was asked + what tool would help. THEN tell the user what you can do as an alternative. This is how the system learns over time — every gap becomes a candidate for the next tool to build.
 
 # Confirmation gate (CRITICAL)
 
@@ -610,6 +767,23 @@ async def run_tools(client: anthropic.Anthropic, conversation: list[dict],
 # Polling loop
 # ---------------------------------------------------------------------------
 
+def _emit_error(slack: SlackClient, channel: str, thread_ts: str | None,
+                  context: str, exc: Exception) -> None:
+    """Post a user-visible :warning: message AND log a full traceback. The whole
+    point: never let the agent fail silently again. If something breaks anywhere
+    in the message-handling path, the user sees it in Slack within seconds."""
+    short = f"{type(exc).__name__}: {exc}"
+    tb = traceback.format_exc()
+    msg = (f":warning: I hit an error in `{context}` and couldn't complete "
+           f"that turn.\n```\n{short[:500]}\n```\n_Full trace in the daemon log._")
+    print(f"[slack_agent] ERROR in {context}: {short}\n{tb}", flush=True)
+    try:
+        slack.post(channel, msg, thread_ts=thread_ts)
+    except Exception as post_e:
+        # Last-resort: at least the log has it.
+        print(f"[slack_agent] failed to post error to Slack: {post_e}", flush=True)
+
+
 async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
                           channel: str, msg: dict) -> None:
     text = msg.get("text", "")
@@ -637,17 +811,25 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
             user_content = user_content + "\n\n" + "\n".join(file_lines)
         conversation.append({"role": "user", "content": user_content})
 
+        # The whole turn is wrapped: any crash → user sees a :warning: reply.
+        reply_text: str | None = None
         try:
             reply_text = await run_tools(anth, conversation, thread_ts)
         except Exception as e:
-            reply_text = f":warning: orchestrator error: {e}"
-            print(f"[slack_agent] error: {e}\n{traceback.format_exc()}", flush=True)
+            _emit_error(slack, channel, thread_ts, "run_tools (LLM/tool loop)", e)
+            return  # don't try to save partial state
 
-        _save_thread(thread_ts, conversation)
+        # Persist conversation. If serialization itself blows up, surface it.
         try:
-            slack.post(channel, reply_text, thread_ts=thread_ts)
+            _save_thread(thread_ts, conversation)
         except Exception as e:
-            print(f"[slack_agent] failed to post reply: {e}", flush=True)
+            _emit_error(slack, channel, thread_ts, "save_thread (state persist)", e)
+            # fall through — we still try to post the reply
+
+        try:
+            slack.post(channel, reply_text or "(no response)", thread_ts=thread_ts)
+        except Exception as e:
+            _emit_error(slack, channel, thread_ts, "slack.post (final reply)", e)
 
 
 async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str) -> int:
@@ -667,7 +849,11 @@ async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str)
         try:
             await handle_message(slack, anth, channel, m)
         except Exception as e:
-            print(f"[slack_agent] handle error: {e}", flush=True)
+            # handle_message already does its own try/except per stage and
+            # posts to Slack; this is the last-resort net for anything that
+            # escapes (e.g. unrecoverable error in the locking path).
+            _emit_error(slack, channel, m.get("thread_ts") or ts,
+                          "poll_once (outer)", e)
         n += 1
     return n
 
