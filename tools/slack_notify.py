@@ -145,6 +145,32 @@ class SlackClient:
             payload["blocks"] = blocks
         return self._post_json("https://slack.com/api/chat.postMessage", payload)
 
+    def add_reaction(self, channel: str, ts: str, name: str) -> dict | None:
+        """Add an emoji reaction. Returns None on best-effort failure
+        (missing scope, already_reacted, etc.) — reactions are UX polish,
+        we never want them to break the main flow."""
+        try:
+            return self._post_json("https://slack.com/api/reactions.add",
+                                     {"channel": channel, "timestamp": ts, "name": name})
+        except Exception as e:
+            err = str(e)
+            if "already_reacted" in err:
+                return None  # benign
+            print(f"[slack] add_reaction({name}) failed: {e}", flush=True)
+            return None
+
+    def remove_reaction(self, channel: str, ts: str, name: str) -> dict | None:
+        """Remove an emoji reaction. Best-effort like add_reaction."""
+        try:
+            return self._post_json("https://slack.com/api/reactions.remove",
+                                     {"channel": channel, "timestamp": ts, "name": name})
+        except Exception as e:
+            err = str(e)
+            if "no_reaction" in err:
+                return None
+            print(f"[slack] remove_reaction({name}) failed: {e}", flush=True)
+            return None
+
 
 class SlackNotifier:
     """Post reply-approval pings to Slack.

@@ -795,6 +795,12 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
     print(f"[slack_agent] msg from {user} ts={ts} thread={thread_ts} files={len(files)} "
            f"text={text[:120]!r}", flush=True)
 
+    # Visual heartbeat: reaction on the user's message changes as we progress.
+    # eyes → working, white_check_mark → done, x → error. All best-effort
+    # (won't break the main flow if reactions:write scope is missing).
+    slack.add_reaction(channel, ts, "eyes")
+    final_reaction = "white_check_mark"  # mutated below if anything fails
+
     lock = THREAD_LOCKS.setdefault(thread_ts, asyncio.Lock())
     async with lock:
         conversation = _load_thread(thread_ts)
@@ -817,6 +823,9 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
             reply_text = await run_tools(anth, conversation, thread_ts)
         except Exception as e:
             _emit_error(slack, channel, thread_ts, "run_tools (LLM/tool loop)", e)
+            final_reaction = "x"
+            slack.remove_reaction(channel, ts, "eyes")
+            slack.add_reaction(channel, ts, final_reaction)
             return  # don't try to save partial state
 
         # Persist conversation. If serialization itself blows up, surface it.
@@ -824,12 +833,18 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
             _save_thread(thread_ts, conversation)
         except Exception as e:
             _emit_error(slack, channel, thread_ts, "save_thread (state persist)", e)
+            final_reaction = "x"
             # fall through — we still try to post the reply
 
         try:
             slack.post(channel, reply_text or "(no response)", thread_ts=thread_ts)
         except Exception as e:
             _emit_error(slack, channel, thread_ts, "slack.post (final reply)", e)
+            final_reaction = "x"
+
+        # Swap reactions: remove the working indicator, mark final state
+        slack.remove_reaction(channel, ts, "eyes")
+        slack.add_reaction(channel, ts, final_reaction)
 
 
 async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str) -> int:
