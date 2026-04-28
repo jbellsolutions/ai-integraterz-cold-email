@@ -1,0 +1,38 @@
+# Forge provider profile routing for Cold Email 2.0.
+# Swap modes by changing `active_mode` below. Forge resolves
+# the per-role model lazily, so changes take effect on next run.
+
+active_mode: default  # default | cost | mock (mock = no LLM calls, for dry-run pilots)
+
+modes:
+  mock:
+    orchestrator: mock
+    strategy:     mock
+    research:     mock
+    hook:         mock
+    body:         mock
+    critic:       mock
+    smartlead:    mock
+
+  default:
+    orchestrator: anthropic-opus-1m     # 1M context window — runs whole campaign in-session
+    strategy:     anthropic-opus
+    research:     anthropic-haiku
+    hook:         anthropic                # = Sonnet (forge's default profile)
+    body:         anthropic-haiku
+    critic:       anthropic-haiku
+    smartlead:    anthropic-haiku
+
+  cost:
+    # 5K+/day campaigns. Hook stays on Sonnet — that's the line that buys attention.
+    orchestrator: anthropic-opus-1m
+    strategy:     anthropic-opus
+    research:     openrouter-deepseek
+    hook:         anthropic
+    body:         openrouter-deepseek
+    critic:       anthropic-haiku
+    smartlead:    anthropic-haiku
+
+# Profile resolution order:
+#   1. ./config/profiles/   (this repo — Opus 4.7 + 1M ctx live here)
+#   2. forge bundled profiles (Sonnet, Haiku, DeepSeek, etc.)

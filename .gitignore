@@ -1,0 +1,48 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Runtime data — per-deployment, contains real lead PII + reply content
+data/leads/*
+data/research/*
+data/emails/*
+data/replies/*
+data/archive/*
+data/cache/*
+data/slack/*
+# But keep the directory shape so the system can boot fresh
+!data/leads/.gitkeep
+!data/research/.gitkeep
+!data/emails/.gitkeep
+!data/replies/.gitkeep
+!data/archive/.gitkeep
+!data/cache/.gitkeep
+!data/slack/.gitkeep
+
+# Per-campaign briefs — strategy IP, may reference live target lists
+data/campaigns/*/brief.md
+data/campaigns/*/run-*.json
+data/campaigns/*/precreated.json
+# Keep an empty marker so the dir exists
+!data/campaigns/.gitkeep
+
+# Daemon logs
+logs/
+nohup.out
+
+# Editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

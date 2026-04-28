@@ -1,0 +1,12 @@
+name: anthropic-opus-1m
+vendor: anthropic
+model: claude-opus-4-7
+max_tokens: 8192
+temperature: 0.5
+cost_tier: premium
+failover: [anthropic-opus]
+extra:
+  prompt_format: messages_v1
+  tool_protocol: anthropic_tool_use
+  context_window: 1m       # 1M-context tier — set via beta header at call time
+  beta_headers: ["context-1m-2025-08-07"]

@@ -1,0 +1,22 @@
+# Smartlead campaign defaults.
+
+campaign_defaults:
+  text_only: true              # plain text, no HTML, no rich formatting
+  open_tracking: false         # open tracking pixels hurt deliverability
+  click_tracking: false
+  stop_on_reply: true
+  stop_on_auto_reply: true
+  daily_send_limit: 30         # per mailbox
+
+sequence_delays_days: [0, 3, 7]   # email 1, 2, 3
+
+subject_constraints:
+  target_chars: 33
+  max_chars: 60
+
+body_constraints:
+  max_words: 100
+
+# CLI/MCP wiring
+cli_command: smartlead
+mcp_server_url: ""   # optional, for reasoning-over-inbox flows
