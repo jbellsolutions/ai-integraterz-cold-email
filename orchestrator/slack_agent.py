@@ -39,8 +39,13 @@ from tools.slack_notify import SlackClient
 
 DATA_DIR = REPO_ROOT / "data" / "slack"
 CURSOR_PATH = DATA_DIR / "cursor.json"
+ACTIVE_THREADS_PATH = DATA_DIR / "active_threads.json"
 THREADS_DIR = DATA_DIR / "threads"
 UPLOADS_DIR = DATA_DIR / "uploads"
+
+# Threads we keep watching for new replies after the parent message is gone
+# from the conversations.history window. Pruned after 7 days of inactivity.
+ACTIVE_THREAD_TTL_SECONDS = 7 * 24 * 3600
 
 # In-memory handles to ephemeral lead lists the user is workshopping mid-thread.
 # {handle_id -> {"leads": [...], "source": str, "created_at": iso}}
@@ -74,6 +79,49 @@ def _load_thread(thread_ts: str) -> list[dict]:
 def _save_thread(thread_ts: str, messages: list[dict]) -> None:
     THREADS_DIR.mkdir(parents=True, exist_ok=True)
     (THREADS_DIR / f"{thread_ts}.json").write_text(json.dumps(messages, indent=2))
+
+
+def _load_active_threads() -> dict:
+    """Map of {thread_ts: {"last_reply_ts": str, "updated_at": iso}}."""
+    if ACTIVE_THREADS_PATH.exists():
+        try:
+            return json.loads(ACTIVE_THREADS_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_active_threads(d: dict) -> None:
+    ACTIVE_THREADS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ACTIVE_THREADS_PATH.write_text(json.dumps(d, indent=2))
+
+
+def _register_active_thread(thread_ts: str, last_reply_ts: str) -> None:
+    """Mark a thread as live so subsequent polls watch it for replies."""
+    d = _load_active_threads()
+    d[thread_ts] = {
+        "last_reply_ts": last_reply_ts,
+        "updated_at": dt.datetime.utcnow().isoformat() + "Z",
+    }
+    _save_active_threads(d)
+
+
+def _prune_active_threads() -> dict:
+    """Drop threads idle longer than ACTIVE_THREAD_TTL_SECONDS. Returns the
+    pruned dict so the caller can iterate without re-loading."""
+    d = _load_active_threads()
+    cutoff = dt.datetime.utcnow() - dt.timedelta(seconds=ACTIVE_THREAD_TTL_SECONDS)
+    keep = {}
+    for tts, meta in d.items():
+        try:
+            updated = dt.datetime.fromisoformat(meta.get("updated_at", "").rstrip("Z"))
+        except Exception:
+            updated = dt.datetime.utcnow()  # keep on parse error
+        if updated >= cutoff:
+            keep[tts] = meta
+    if len(keep) != len(d):
+        _save_active_threads(keep)
+    return keep
 
 
 def _new_handle(prefix: str = "leads") -> str:
@@ -753,6 +801,27 @@ after `launch_pilot` runs and after you call `preview_emails`.
 10. **Capability gaps**: when a request would require a tool you don't have, FIRST call `log_capability_gap` with what was asked + what tool would help. THEN tell the user what you can do as an alternative. This is how the system learns over time — every gap becomes a candidate for the next tool to build.
 11. **Feedback on copy / voice / rules (CRITICAL — DO THE WORK)**: when the user gives feedback like "stop saying X", "the voice should be Y", "for campaign Z drop W" — DO NOT just acknowledge what you'll change. Actually call `update_voice_rules` (for cross-campaign feedback) and/or `update_brief` (for one-campaign feedback) RIGHT THEN. Then call `generate_preview_pack` to regenerate samples. Then post the new samples to the thread. The full sequence in ONE turn: (a) update voice rules / briefs, (b) confirm what was written, (c) re-run preview pack. Never end a turn after just summarizing the user's feedback — that wastes their time.
 
+12. **Inference defaults (CRITICAL — STOP ASKING REDUNDANT QUESTIONS)**: Justin has ~1,500-2,000 recruiter leads already loaded into the existing Smartlead recruiter campaigns. When he says any of these without specifying a source:
+    - "take the leads"
+    - "split the leads across campaigns"
+    - "use those leads"
+    - "load some leads"
+    - "fire them up"
+    - "start sending"
+    you must INFER the source — DO NOT ask "what's the lead source?" That's the bug Justin called out. The default is: leads are already inside the existing recruiter Smartlead campaigns. Your job is to:
+    (a) Call `list_active_campaigns` to find which recruiter campaigns currently hold leads (the populated ones, not the empty pre-created ones).
+    (b) Call `load_leads_from_smartlead` with the source campaign ID(s) to get a lead handle.
+    (c) Filter to non-responders (those without a positive reply tag) where applicable.
+    (d) Split the handle's leads evenly across the target campaigns the user named.
+    (e) Confirm the plan in ONE concise message with counts ("Loading 1,847 non-responders from `<source>`, splitting 369-370 per campaign across A/B/C/D/E. Confirm to proceed?") and only call `launch_pilot` after the user says yes.
+
+    Similarly: when Justin names campaigns by short forms like "Recruiters Power Partner A" → map to `recruiters-power-partner-A`. Never ask him to repeat himself in canonical form. If he says "all 5 campaigns" or "all 6 campaigns", treat the existing pre-created recruiter set as the default.
+
+13. **Waterfall request (lead progression across campaigns)**: when Justin says "leads that don't respond should move to the next campaign" / "tag leads with each campaign they go through" — this is a multi-stage flow we don't have a single tool for yet. Do this:
+    (a) Call `log_capability_gap` describing it (so the next tool to build is "waterfall_advance: pull non-responders from campaign A, add to campaign B, tag with `sent-A`").
+    (b) Tell Justin the manual waterfall steps clearly: launch A now → wait 7-10 days → use `load_leads_from_smartlead` to pull non-responders from A → `launch_pilot` into B → repeat for C/D/E. Acknowledge that this is manual today and the auto-progression is on the next-tools list.
+    (c) Do NOT block the immediate ask (launching A) on the waterfall question — execute today's launch first, document the followup second.
+
 # Confirmation gate (CRITICAL)
 
 NEVER call any of these without an explicit user "yes" / "go" / "confirm" / "do it" / "launch" in the most recent user message:
@@ -873,6 +942,10 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
     print(f"[slack_agent] msg from {user} ts={ts} thread={thread_ts} files={len(files)} "
            f"text={text[:120]!r}", flush=True)
 
+    # Register this thread as active so the poll loop also watches for reply
+    # messages here (conversations.history doesn't return thread replies).
+    _register_active_thread(thread_ts, ts)
+
     # Visual heartbeat: reaction on the user's message changes as we progress.
     # eyes → working, white_check_mark → done, x → error. All best-effort
     # (won't break the main flow if reactions:write scope is missing).
@@ -926,11 +999,17 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
 
 
 async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str) -> int:
+    """Single poll cycle: top-level channel messages, THEN active-thread replies.
+
+    Slack's conversations.history only returns parent messages — thread replies
+    do NOT show up there. Without the second pass, the agent posts a reply in
+    a thread and is then deaf to the user's responses in that same thread,
+    even when @-mentioned. Fixed by tracking active threads in
+    data/slack/active_threads.json and polling each one's replies.
+    """
     cursor = _load_cursor()
     last = cursor.get(channel)
     msgs = slack.read_channel(channel, oldest=last)
-    if not msgs:
-        return 0
     n = 0
     for m in msgs:
         ts = m.get("ts")
@@ -942,12 +1021,35 @@ async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str)
         try:
             await handle_message(slack, anth, channel, m)
         except Exception as e:
-            # handle_message already does its own try/except per stage and
-            # posts to Slack; this is the last-resort net for anything that
-            # escapes (e.g. unrecoverable error in the locking path).
             _emit_error(slack, channel, m.get("thread_ts") or ts,
                           "poll_once (outer)", e)
         n += 1
+
+    # Pass 2: poll replies in every active thread.
+    active = _prune_active_threads()
+    for thread_ts, meta in list(active.items()):
+        last_reply = meta.get("last_reply_ts", thread_ts)
+        try:
+            replies = slack.read_thread(channel, thread_ts, oldest=last_reply)
+        except Exception as e:
+            print(f"[slack_agent] read_thread({thread_ts}) failed: {e}", flush=True)
+            continue
+        for r in replies:
+            r_ts = r.get("ts")
+            if not r_ts:
+                continue
+            # Inject thread_ts so handle_message threads under the same parent
+            r["thread_ts"] = thread_ts
+            try:
+                await handle_message(slack, anth, channel, r)
+            except Exception as e:
+                _emit_error(slack, channel, thread_ts,
+                              "poll_once (thread reply)", e)
+            # advance the per-thread cursor as we go
+            active[thread_ts]["last_reply_ts"] = r_ts
+            active[thread_ts]["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
+            _save_active_threads(active)
+            n += 1
     return n
 
 

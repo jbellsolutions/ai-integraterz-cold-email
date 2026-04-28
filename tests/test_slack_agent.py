@@ -131,10 +131,50 @@ def test_copy_squad_handles_null_pick_in_hook():
     assert select({"candidates": ["x", "y", "z"], "pick": 2}) == "z"
 
 
+def test_active_thread_tracking_round_trip(tmp_path=None):
+    """Regression: 2026-04-28 — Slack `conversations.history` only returns
+    top-level channel messages, so when the agent posts a reply in a thread
+    and Justin replies in that thread, the daemon never sees the reply. Even
+    @-mentions in threads were dropped on the floor. Fix tracks every thread
+    we've seen in data/slack/active_threads.json and the poll loop also
+    polls conversations.replies on each one. This test verifies the helpers
+    round-trip through disk and prune correctly.
+    """
+    import datetime as dt
+    import json
+    import os
+    from orchestrator import slack_agent as sa
+
+    # Redirect to a temp path so the test doesn't trample real state
+    if tmp_path is None:
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+    else:
+        tmp = Path(tmp_path)
+    sa.ACTIVE_THREADS_PATH = tmp / "active_threads.json"
+
+    # Round-trip
+    sa._register_active_thread("1777400000.000001", "1777400000.000001")
+    sa._register_active_thread("1777400500.000002", "1777400500.000002")
+    d = sa._load_active_threads()
+    assert "1777400000.000001" in d
+    assert "1777400500.000002" in d
+    assert d["1777400000.000001"]["last_reply_ts"] == "1777400000.000001"
+
+    # Prune drops stale entries
+    stale = json.loads(sa.ACTIVE_THREADS_PATH.read_text())
+    stale["1777400000.000001"]["updated_at"] = "2020-01-01T00:00:00Z"
+    sa.ACTIVE_THREADS_PATH.write_text(json.dumps(stale))
+    pruned = sa._prune_active_threads()
+    assert "1777400000.000001" not in pruned
+    assert "1777400500.000002" in pruned
+
+
 if __name__ == "__main__":
     test_thread_state_is_json_serializable()
     test_serialization_handles_anthropic_blocks_via_run_tools_logic()
     test_tool_registry_consistency()
     test_copy_squad_handles_null_pick_in_hook()
     test_copy_squad_handles_null_sequence_in_body_output()
+    test_active_thread_tracking_round_trip()
     print("All slack_agent regression tests pass ✓")

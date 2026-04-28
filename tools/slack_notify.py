@@ -119,6 +119,49 @@ class SlackClient:
         # newest first from API → reverse to chronological
         return list(reversed(out))
 
+    def read_thread(self, channel: str, thread_ts: str,
+                       oldest: str | None = None,
+                       limit: int = 50) -> list[dict]:
+        """Return thread replies newer than `oldest` ts. Filters out the bot's
+        own replies and the parent message itself (we only want NEW input from
+        the user). Uses `conversations.replies` — `conversations.history` does
+        NOT return thread replies, only top-level channel messages.
+
+        Slack quirk: `oldest` is INCLUSIVE in conversations.replies — the
+        message at `oldest` is returned. We filter it out below by ts > oldest.
+        """
+        me = self.whoami()
+        params = {"channel": channel, "ts": thread_ts, "limit": limit}
+        if oldest:
+            params["oldest"] = oldest
+        r = self._get("https://slack.com/api/conversations.replies", params=params)
+        data = r.json()
+        if not data.get("ok"):
+            err = data.get("error", "unknown")
+            # thread_not_found is normal when the parent has been deleted —
+            # don't raise, just return empty.
+            if err in ("thread_not_found", "channel_not_found"):
+                return []
+            raise RuntimeError(f"conversations.replies failed: {err}")
+        msgs = data.get("messages", [])
+        out = []
+        for m in msgs:
+            ts = m.get("ts")
+            if not ts:
+                continue
+            # skip the parent (it's in the channel poll) + anything <= oldest
+            if oldest and ts <= oldest:
+                continue
+            if ts == thread_ts:
+                continue
+            if m.get("user") == me or m.get("bot_id"):
+                continue
+            if m.get("subtype") in ("bot_message", "channel_join", "channel_leave"):
+                continue
+            out.append(m)
+        # API returns chronological for replies — keep that order
+        return out
+
     def download_file(self, url_private: str, dest_path) -> "Path":
         """Download a Slack-uploaded file using bot-token Authorization."""
         from pathlib import Path
