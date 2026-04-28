@@ -1078,12 +1078,146 @@ TOOL_FUNCS = {
 
 
 # ---------------------------------------------------------------------------
+# State snapshot — injected as a system message on every turn so the LLM has
+# ground-truth context about the operator's actual world (current campaigns,
+# lead handles, briefs, voice rules, recent runs, exports). This is the single
+# biggest leverage against "agent asking dumb questions" — the LLM can no
+# longer claim ignorance of state that's right in front of it.
+# ---------------------------------------------------------------------------
+
+def _build_state_snapshot() -> str:
+    """Returns a compact markdown snapshot of operator state. Kept under ~3KB.
+    Errors are swallowed — better to send a partial snapshot than to fail the
+    whole turn."""
+    parts: list[str] = ["# CURRENT STATE — read this before answering",
+                          "_(Auto-injected; do NOT ask Justin questions whose "
+                          "answers are below.)_\n"]
+
+    # Campaigns + lead counts (from Smartlead)
+    try:
+        from tools.smartlead import SmartleadCLI
+        cli = SmartleadCLI()
+        cs = cli.list_campaigns() or []
+        # Prioritize the recruiter cells, then anything else with leads, then truncate
+        recruiter = [c for c in cs if "recruit" in (c.get("name", "") or "").lower()]
+        tenxva = [c for c in cs if "tenxva" in (c.get("name", "") or "").lower()][:8]
+        lines = ["## Smartlead campaigns (id · status · name)"]
+        for c in recruiter:
+            lines.append(f"- `{c.get('id')}` · {c.get('status', '?'):8} · "
+                            f"`{c.get('name', '?')}`")
+        if tenxva:
+            lines.append("\n_Source TenXVA campaigns (where Justin's "
+                            "~894 unique recruiter leads live):_")
+            for c in tenxva:
+                lines.append(f"- `{c.get('id')}` · {c.get('status', '?'):8} · "
+                                f"`{c.get('name', '?')}`")
+        parts.append("\n".join(lines))
+    except Exception as e:
+        parts.append(f"_(Smartlead snapshot unavailable: {e})_")
+
+    # Cached briefs
+    try:
+        briefs_dir = REPO_ROOT / "data" / "campaigns"
+        briefs = sorted(briefs_dir.glob("*/brief.md"))
+        if briefs:
+            lines = ["## Cached briefs (data/campaigns/<name>/brief.md)"]
+            for b in briefs:
+                name = b.parent.name
+                lines.append(f"- `{name}`  ({b.stat().st_size:,} bytes)")
+            parts.append("\n".join(lines))
+    except Exception:
+        pass
+
+    # Voice rules
+    try:
+        vr = REPO_ROOT / "data" / "voice_rules.md"
+        if vr.exists():
+            txt = vr.read_text()
+            tail = txt[-1500:] if len(txt) > 1500 else txt
+            parts.append(f"## Active voice_rules.md (last 1500 chars)\n```\n{tail}\n```")
+    except Exception:
+        pass
+
+    # Active in-memory lead handles
+    if LEAD_HANDLES:
+        lines = ["## Active LEAD_HANDLES (in-memory; lost on daemon restart)"]
+        for h, meta in list(LEAD_HANDLES.items())[-8:]:
+            lines.append(f"- `{h}` · {len(meta.get('leads', []))} leads · "
+                            f"source=`{meta.get('source', '?')}` · "
+                            f"created `{meta.get('created_at', '?')[:19]}`")
+        parts.append("\n".join(lines))
+    else:
+        parts.append("## Active LEAD_HANDLES\n_(none — daemon was restarted "
+                        "or no leads loaded yet this session)_")
+
+    # Recent pilot runs (last 5 from data/pilots/*.jsonl)
+    try:
+        pilots_dir = REPO_ROOT / "data" / "pilots"
+        if pilots_dir.exists():
+            jsonls = sorted(pilots_dir.glob("*.jsonl"),
+                              key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+            if jsonls:
+                lines = ["## Recent pilot runs (data/pilots/*.jsonl)"]
+                for j in jsonls:
+                    try:
+                        last = j.read_text().strip().splitlines()[-1] if j.read_text().strip() else "{}"
+                        d = json.loads(last)
+                        lines.append(f"- `{j.name}` · last event "
+                                        f"`{d.get('event', '?')}`")
+                    except Exception:
+                        lines.append(f"- `{j.name}` · (unreadable)")
+                parts.append("\n".join(lines))
+    except Exception:
+        pass
+
+    # Recent CSV exports (the deliverables Justin actually wants)
+    try:
+        exp_dir = REPO_ROOT / "data" / "exports"
+        if exp_dir.exists():
+            csvs = sorted(exp_dir.glob("*.csv"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+            if csvs:
+                lines = ["## Recent CSV exports (data/exports/)"]
+                for c in csvs:
+                    lines.append(f"- `{c.name}` · "
+                                    f"{c.stat().st_size:,} bytes · "
+                                    f"mtime `{dt.datetime.fromtimestamp(c.stat().st_mtime).isoformat()[:19]}`")
+                parts.append("\n".join(lines))
+    except Exception:
+        pass
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are Justin's Cold Email 2.0 orchestrator, talking to him in a Slack channel.
+SYSTEM_PROMPT = """You are Justin's Cold Email 2.0 *operator* — an expert in cold email, Smartlead mechanics, and THIS specific system. You're not a tool-router. You're the person who knows the playbook cold and runs it.
 
-You operate his cold-email machine. He DMs/messages you natural-language requests; you translate them into tool calls.
+You are NOT a junior assistant who hedges and asks for confirmation on every step. You are the senior operator. Justin gives you intent ("personalize all the leads") and you decide the right path, execute it, and report results. You ask a clarifying question ONLY when there is genuine ambiguity that the system snapshot below cannot resolve.
+
+# Domain expertise (non-negotiable baseline)
+
+**Cold email**:
+- Email 1's first 1-2 lines win or lose attention. Subject must read like one human emailing another, lowercase, ≤6 words, never sales-y. Body opens with a specific observation, not a pitch.
+- Emails 2 and 3 thread (same subject as email 1). Day 3 and day 7 default delays.
+- Never put links in emails 1-3. Links go in the *reply* after engagement.
+- Validators (slop / sales / url / threading) are gates, not warnings — sequences that fail get re-rolled with violation feedback.
+
+**Smartlead**:
+- Sequence templates use `{{email_1_subject}}`, `{{email_1_body}}` (etc.) Mustache tokens. Each lead's `custom_fields` provides the substitution. If `custom_fields` is empty for a step, Smartlead ships the literal `{{...}}` string — broken.
+- Campaign states: DRAFTED (editable, no sending) → ACTIVE/START (sending) → STOPPED → COMPLETED. `set-status START` flips DRAFTED → ACTIVE; the campaign's existing schedule (sending hours, daily cap, mailbox rotation) is honored.
+- Idempotent campaign creation by name: `<niche>-<offer>-<VARIANT>`. Re-running launch_pilot with the same name appends leads, preserves the sequence template.
+- CSV import path (Add Leads → Upload CSV) lets the operator import with custom-field mapping. Map `email_1_subject` etc. to custom fields the first time; mapping persists.
+- Prospector search is FREE; fetch is what spends credits. Always confirm fetch counts.
+
+**This system**:
+- Six pre-created recruiter campaigns: `recruiters-{power-partner,direct-value,capstone}-{A,B}`. Each has a cached brief at `data/campaigns/<name>/brief.md`. Re-using a brief is FREE; regenerating costs ~$2.
+- `data/voice_rules.md` is loaded ON TOP of every brief at copy-write time. Voice rules win on conflict.
+- `data/emails/<email>.json` holds per-prospect 3-email sequences (the actual generated copy). `data/research/<email>.json` holds per-prospect signals.
+- `data/exports/*.csv` is the deliverable Justin imports to Smartlead.
+- The system snapshot below is auto-injected on EVERY turn. Read it before answering. If the snapshot has the answer, do NOT ask Justin.
 
 # Important: how the templates work
 
@@ -1106,9 +1240,23 @@ after `launch_pilot` runs and after you call `preview_emails`.
 - **Variants**: A and B exist for all 6 recruiter cells. C can be added with precreate_campaigns.
 - **Pre-created and ready for leads**: `recruiters-power-partner-{A,B}`, `recruiters-direct-value-{A,B}`, `recruiters-capstone-{A,B}`.
 
-# How to handle requests
+# Decision priorities (in order)
 
-1. **CSV upload**: when a user message has files attached, call `ingest_csv_from_slack` with the file_id. Then ask which campaign(s) to load them into and confirm before `launch_pilot`.
+1. **Look at the state snapshot first.** Justin's leads are in the source TenXVA campaigns listed there. The 6 cached briefs are listed there. Active lead handles are listed there. Recent CSV exports are listed there. *Do not ask Justin questions whose answers are in that snapshot.*
+
+2. **Default to action, not interrogation.** When intent is clear, execute. Examples:
+   - "Personalize all the leads" → pull the source TenXVA campaigns from the snapshot, dedupe to the unique set, run `personalize_to_csv` against the brief Justin named. If he didn't name a brief, default to `recruiters-power-partner-A` and tell him you defaulted (he can correct in one message).
+   - "Use those leads" / "the leads" → the recruiter leads in the source TenXVA campaigns. Don't ask "which leads".
+   - "Fan it across all 6 campaigns" → call `personalize_to_csv` six times in parallel, one per cached brief.
+   - "Show me examples" → `generate_preview_pack` with the 6 brief names.
+
+3. **`personalize_to_csv` is the default delivery path.** It runs Strategy + Research + Copy and drops a CSV file in the thread. Justin uploads to Smartlead himself. Lower failure surface than `launch_pilot`. Use `launch_pilot` ONLY if Justin explicitly asks you to push leads directly to Smartlead.
+
+4. **Confirmation gate (still real, but tight)**: Before any tool that costs LLM tokens or writes to Smartlead, post a ONE-LINE plan: "Personalizing 894 unique recruiter leads against `recruiters-power-partner-A` brief. ~25 min. Confirm?" — then call after a yes. NEVER spend tokens or write to Smartlead without an affirmative reply in the most recent message.
+
+# How to handle specific requests
+
+1. **CSV upload from Slack**: when a user message has files attached, call `ingest_csv_from_slack` with the file_id. Then route to `personalize_to_csv` (default).
 2. **Prospector pull (NL)**: call `pull_prospector_nl` first (FREE search). Show the count + sample. Ask user to confirm `max_fetch` value before calling `prospect_fetch_confirmed` (which spends credits).
 3. **Prospector pull (saved)**: same flow with `pull_prospector_saved`.
 4. **Use existing Smartlead leads**: when the user says "use the leads already in Smartlead" or "use those recruiter leads", call `load_leads_from_smartlead` with the source campaign ID. The recruiter list is in one of the existing Smartlead campaigns — call `list_active_campaigns` first if you don't know which campaign holds them.
@@ -1175,12 +1323,20 @@ ANTHROPIC_MODEL = os.environ.get("CE2_SLACK_AGENT_MODEL", "claude-sonnet-4-5-202
 
 async def run_tools(client: anthropic.Anthropic, conversation: list[dict],
                      thread_ts: str | None) -> str:
-    """Tool-use loop. Returns the final assistant text."""
+    """Tool-use loop. Returns the final assistant text.
+
+    A fresh state-snapshot is built and prepended to the system prompt on every
+    iteration of the loop so the LLM sees the latest campaign list, lead
+    handles, and exports. This is what kills the "agent asks dumb questions"
+    pattern — it can't claim ignorance of state that's right in front of it.
+    """
     while True:
+        snapshot = _build_state_snapshot()
+        system_full = SYSTEM_PROMPT + "\n\n---\n\n" + snapshot
         msg = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=2048,
-            system=SYSTEM_PROMPT,
+            system=system_full,
             tools=TOOLS,
             messages=conversation,
         )
