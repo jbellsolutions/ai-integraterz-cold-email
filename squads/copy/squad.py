@@ -126,25 +126,46 @@ def slop_check(text: str) -> tuple[bool, list[str]]:
     return (len(hits) == 0, hits)
 
 
-# Patterns that indicate selling-not-conversation tone (Justin's feedback rule):
-# fake timeframes, "free", program-language, sourcing-agent default.
+# Patterns that indicate selling-not-conversation tone. Justin's rule:
+# cold email starts a conversation; pitches/offers/money-talk land in the
+# REPLY after the prospect engages, not in the cold open or follow-ups.
 SALES_PATTERNS = [
+    # Fake timeframes
     "14-day sprint", "14 day sprint",
     "30-day sprint", "30 day sprint",
     "6-10 weeks", "6 to 10 weeks", "six to ten weeks",
+    # "Free" framing — Justin: never in the hook
     "for free", "completely free", "absolutely free",
-    "ai sourcing agent",  # banned default unless brief overrides
+    "free to install", "free to deploy", "free recruiter",
+    "install for free", "give them to you for free",
+    # Default product framing he banned
+    "ai sourcing agent",
+    # Program-talk
     "this program", "our program",
     "limited spots", "limited time",
     "act now", "don't miss",
+    # Money/partner talk in cold emails — should be in REPLY only
+    "$1k", "$1,000", "$150/mo", "$150 per month",
+    "per placement", "rev share", "rev-share",
+    "revenue share", "revenue-share",
+    "partner deal", "partner thing",
+    "monthly deposit", "monthly recurring",
+    "commission", "kickback", "referral fee",
 ]
+
+FREE_WORD_RE = re.compile(r"\bfree\b", re.IGNORECASE)
 
 
 def sales_check(text: str) -> tuple[bool, list[str]]:
-    """Catches selling-not-conversation tone. Justin's rule: cold email is the
-    start of a conversation, not a pitch. Returns (passes, violations)."""
+    """Catches selling-not-conversation tone. Returns (passes, violations).
+    Banned: fake timeframes, 'free' in hooks/bodies, money/partner talk
+    (which belongs in the post-reply conversation, not in cold emails)."""
     lower = text.lower()
-    return ([] == (hits := [p for p in SALES_PATTERNS if p in lower]), hits)
+    hits = [p for p in SALES_PATTERNS if p in lower]
+    # The bare word "free" — Justin: never in a cold email. Period.
+    if FREE_WORD_RE.search(text):
+        hits.append("bare-word 'free' (use only after their reply)")
+    return (len(hits) == 0, hits)
 
 
 URL_RE = re.compile(r"https?://\S+|www\.\S+|\b[a-z0-9.-]+\.(com|io|ai|co|net|org)\b/\S+",
@@ -196,13 +217,18 @@ class CopySquad:
         )
         self.tools = ToolRegistry()
 
-    async def write_one(self, lead: Lead, signal: dict, max_retries: int = 2) -> dict:
+    async def write_one(self, lead: Lead, signal: dict, max_retries: int = 3) -> dict:
         """Hook → body → all checks (slop + sales + URLs + threading), with
-        retry on any failure."""
+        retry that injects the failed violations into the next prompt so the
+        model knows specifically what to fix."""
         hook = await self._draft_hook(lead, signal)
         all_violations: list[str] = []
         for attempt in range(max_retries + 1):
-            sequence = await self._draft_body(lead, signal, hook)
+            # On retry, feed violations to the body squad. If the violations
+            # mention the hook (sales-tone in the subject or hook patterns),
+            # also re-roll the hook with the violation feedback.
+            sequence = await self._draft_body(lead, signal, hook,
+                                                previous_violations=all_violations or None)
             seq_list = _safe_list(sequence.get("sequence"))
             full_text = "\n".join((e.get("subject") or "") + "\n" + (e.get("body") or "") for e in seq_list)
 
@@ -218,6 +244,19 @@ class CopySquad:
                 + [f"url-rule: {h}" for h in url_hits]
                 + [f"threading: {h}" for h in thread_hits]
             )
+
+            # Re-roll hook if the failure looks hook-driven (sales/slop in
+            # the subject or first body line). Cheap insurance.
+            if not all_passed and attempt < max_retries:
+                first_subj_body = ((seq_list[0].get("subject") or "") + " "
+                                     + (seq_list[0].get("body") or "")[:200]) if seq_list else ""
+                hook_implicated = any(
+                    p in first_subj_body.lower() for p in
+                    ("free", "14-day", "ai sourcing agent", "$1k", "rev share")
+                )
+                if hook_implicated:
+                    hook = await self._draft_hook(lead, signal,
+                                                     previous_violations=all_violations)
 
             if all_passed:
                 out = {
@@ -241,7 +280,8 @@ class CopySquad:
         self._save(lead, out)
         return out
 
-    async def _draft_hook(self, lead: Lead, signal: dict) -> dict:
+    async def _draft_hook(self, lead: Lead, signal: dict,
+                            previous_violations: list[str] | None = None) -> dict:
         routing = load_routing()
         spawner = Spawner(
             tools=self.tools,
@@ -250,11 +290,20 @@ class CopySquad:
         )
         spec = SwarmSpec(topology=Topology.SOLO, consensus=Consensus.QUEEN, members=[routing["hook"]])
         task = f"PROSPECT: {lead.name} ({lead.title}) at {lead.company}\nSIGNAL: {json.dumps(signal)}"
+        if previous_violations:
+            task += (
+                "\n\nPREVIOUS ATTEMPT FAILED VALIDATION. The earlier hook produced "
+                "downstream copy with these violations — your hook is contributing. "
+                "Pick a meaningfully different angle this time, especially avoiding "
+                "the patterns called out below:\n- "
+                + "\n- ".join(previous_violations[:8])
+            )
         result = await spawner.run(task, spec)
         text = result.members[0][1].final_text if result.members else "{}"
         return _safe_json(text, default={"candidates": [""], "pick": 0})
 
-    async def _draft_body(self, lead: Lead, signal: dict, hook: dict) -> dict:
+    async def _draft_body(self, lead: Lead, signal: dict, hook: dict,
+                            previous_violations: list[str] | None = None) -> dict:
         routing = load_routing()
         spawner = Spawner(
             tools=self.tools,
@@ -268,6 +317,16 @@ class CopySquad:
             f"SIGNAL: {json.dumps(signal)}\n"
             f"CHOSEN HOOK (must open Email 1 with this or a close variant): {chosen}"
         )
+        if previous_violations:
+            task += (
+                "\n\nPREVIOUS ATTEMPT FAILED VALIDATION. Fix EVERY violation below; "
+                "do not produce a draft that contains any of these patterns:\n- "
+                + "\n- ".join(previous_violations[:12])
+                + "\n\nIn particular: re-read the voice rules at the top of the brief. "
+                "If you used 'free', '$1K', 'rev share', or any sales/program/timeframe "
+                "language, REMOVE it. Cold emails open conversations, money/partner-talk "
+                "lands only in the reply after they engage."
+            )
         result = await spawner.run(task, spec)
         text = result.members[0][1].final_text if result.members else "{}"
         return _safe_json(text, default={"sequence": []})
