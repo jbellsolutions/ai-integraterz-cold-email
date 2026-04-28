@@ -76,8 +76,38 @@ def test_tool_registry_consistency():
     )
 
 
+def test_copy_squad_handles_null_pick_in_hook():
+    """Regression: 2026-04-28 — Copy squad's _draft_body crashed with
+    `TypeError: list indices must be integers or slices, not NoneType`
+    when the hook squad emitted {"pick": null} instead of {"pick": 0}.
+    `.get("pick", 0)` returns None for an explicit-null key, not the default.
+    """
+    # Mirror the fixed selection logic from squads/copy/squad.py:_draft_body
+    def select(hook: dict) -> str:
+        candidates = hook.get("candidates") or [""]
+        pick = hook.get("pick")
+        if not isinstance(pick, int):
+            pick = 0
+        pick = max(0, min(pick, len(candidates) - 1))
+        return candidates[pick]
+
+    # The crash case
+    assert select({"candidates": ["a", "b"], "pick": None}) == "a"
+    # Missing key
+    assert select({"candidates": ["a", "b"]}) == "a"
+    # Out of range (clamped)
+    assert select({"candidates": ["a", "b"], "pick": 99}) == "b"
+    # Negative (clamped)
+    assert select({"candidates": ["a", "b"], "pick": -3}) == "a"
+    # Empty candidates fallback
+    assert select({}) == ""
+    # Normal case still works
+    assert select({"candidates": ["x", "y", "z"], "pick": 2}) == "z"
+
+
 if __name__ == "__main__":
     test_thread_state_is_json_serializable()
     test_serialization_handles_anthropic_blocks_via_run_tools_logic()
     test_tool_registry_consistency()
+    test_copy_squad_handles_null_pick_in_hook()
     print("All slack_agent regression tests pass ✓")

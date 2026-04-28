@@ -148,7 +148,14 @@ class CopySquad:
             max_turns=4,
         )
         spec = SwarmSpec(topology=Topology.SOLO, consensus=Consensus.QUEEN, members=[routing["body"]])
-        chosen = hook.get("candidates", [""])[hook.get("pick", 0)]
+        # `.get("pick", 0)` returns None if the key exists with value None
+        # (the LLM sometimes emits {"pick": null}). Coerce defensively, clamp.
+        candidates = hook.get("candidates") or [""]
+        pick = hook.get("pick")
+        if not isinstance(pick, int):
+            pick = 0
+        pick = max(0, min(pick, len(candidates) - 1))
+        chosen = candidates[pick]
         task = (
             f"PROSPECT: {lead.name} ({lead.title}) at {lead.company}\n"
             f"SIGNAL: {json.dumps(signal)}\n"
