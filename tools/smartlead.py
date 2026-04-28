@@ -82,6 +82,24 @@ class SmartleadCLI:
         out = self._run_json(["campaigns", "list"])
         return out if isinstance(out, list) else out.get("data", [])
 
+    def list_campaign_leads(self, campaign_id: int | str, limit: int = 100,
+                              all_pages: bool = True) -> list[dict]:
+        """Pull leads attached to an existing Smartlead campaign.
+
+        all_pages=True uses --all and ignores limit. Useful when you want every
+        lead the campaign has (e.g. taking an existing recruiter list and
+        re-targeting it with new copy).
+        """
+        if _mock_enabled():
+            return []
+        args = ["leads", "list", "--campaign-id", str(campaign_id)]
+        if all_pages:
+            args.append("--all")
+        else:
+            args.extend(["--limit", str(limit)])
+        out = self._run_json(args)
+        return out if isinstance(out, list) else out.get("data", []) or []
+
     def delete_campaign(self, campaign_id: int | str) -> dict:
         if _mock_enabled():
             return {"deleted": True, "id": campaign_id}

@@ -129,6 +129,38 @@ def load_leads_from_prospect(
     return leads
 
 
+def load_leads_from_campaign(campaign_id: int | str, max_n: int | None = None,
+                                cli: SmartleadCLI | None = None) -> list[Lead]:
+    """Pull leads OUT of an existing Smartlead campaign and map to Lead.
+
+    Use case: an old campaign already has a hand-curated list of recruiters;
+    we want to run them through OUR pipeline and seed a new (niche, offer,
+    variant) campaign with the same people but new copy.
+    """
+    cli = cli or SmartleadCLI()
+    raw = cli.list_campaign_leads(campaign_id, all_pages=True)
+    if max_n:
+        raw = raw[:max_n]
+    leads: list[Lead] = []
+    for item in raw:
+        # Smartlead returns {lead: {...}, ...} with the actual lead under "lead"
+        l = item.get("lead") if isinstance(item.get("lead"), dict) else item
+        email = l.get("email") or ""
+        if not email:
+            continue
+        first = l.get("first_name") or l.get("firstName") or ""
+        last = l.get("last_name") or l.get("lastName") or ""
+        leads.append(Lead(
+            lead_id=email,
+            name=f"{first} {last}".strip() or email,
+            email=email,
+            company=l.get("company_name") or l.get("company") or "",
+            title=l.get("title") or l.get("job_title") or "",
+            linkedin_url=l.get("linkedin_url") or l.get("linkedin") or "",
+        ))
+    return leads
+
+
 def lead_summary(leads: list[Lead], n: int = 10) -> str:
     """Compact human-readable sample for the Strategy squad."""
     sample = leads[:n]

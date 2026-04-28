@@ -237,6 +237,119 @@ def tool_launch_pilot(args: dict) -> dict:
             "note": "Running in background. I will message this thread when done (~2-5 min)."}
 
 
+def tool_load_leads_from_smartlead(args: dict) -> dict:
+    """Pull leads OUT of an existing Smartlead campaign by ID. Returns a lead
+    handle the user can then route into one of our new (niche, offer, variant)
+    campaigns. FREE — no credits consumed."""
+    from tools.lead_loader import load_leads_from_campaign, lead_summary
+    cid = args["campaign_id"]
+    max_n = args.get("max_n")
+    leads = load_leads_from_campaign(cid, max_n=max_n)
+    if not leads:
+        return {"lead_handle": None, "count": 0,
+                "warning": f"campaign {cid} has no leads (or all are missing emails)"}
+    handle = _new_handle("from-campaign")
+    LEAD_HANDLES[handle] = {
+        "leads": leads, "source": f"smartlead_campaign:{cid}",
+        "created_at": dt.datetime.utcnow().isoformat(),
+    }
+    return {"lead_handle": handle, "count": len(leads),
+            "summary": lead_summary(leads)}
+
+
+def tool_preview_emails(args: dict) -> dict:
+    """Render N sample drafted emails (subject + body for sequence 1/2/3) for a
+    given campaign so the user can spot-check copy quality before sending.
+
+    Reads from data/emails/<email>.json (where the Copy squad writes per-prospect
+    sequences). Filters by the lead emails currently attached to the named
+    campaign in Smartlead.
+    """
+    from tools.smartlead import SmartleadCLI
+    name = args["campaign_name"]
+    n = int(args.get("n", 5))
+    step_filter = int(args["step"]) if args.get("step") else None
+
+    # 1. Look up campaign + its current leads
+    cli = SmartleadCLI()
+    camp = cli.get_campaign_by_name(name)
+    if not camp:
+        return {"error": f"no Smartlead campaign named '{name}'"}
+    cid = camp.get("id")
+    raw_leads = cli.list_campaign_leads(cid, all_pages=True)
+    emails_in_camp = set()
+    for item in raw_leads:
+        l = item.get("lead") if isinstance(item.get("lead"), dict) else item
+        e = (l.get("email") or "").lower()
+        if e:
+            emails_in_camp.add(e)
+
+    if not emails_in_camp:
+        return {"error": f"campaign '{name}' has no leads attached yet — run "
+                          f"launch_pilot first to populate it"}
+
+    # 2. Walk data/emails/ and pull matching files
+    emails_dir = REPO_ROOT / "data" / "emails"
+    if not emails_dir.exists():
+        return {"error": "data/emails/ does not exist — no copy generated yet"}
+    samples = []
+    for f in sorted(emails_dir.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        lead = data.get("lead") or {}
+        email_addr = (lead.get("email") or data.get("email") or "").lower()
+        if email_addr not in emails_in_camp:
+            continue
+        seq = (data.get("emails") or {}).get("sequence") or data.get("sequence") or []
+        sample = {
+            "name": lead.get("name", ""),
+            "email": email_addr,
+            "company": lead.get("company", ""),
+            "title": lead.get("title", ""),
+            "slop_pass": data.get("slop_pass"),
+            "steps": [],
+        }
+        for step in seq:
+            si = step.get("step", 0)
+            if step_filter and si != step_filter:
+                continue
+            sample["steps"].append({
+                "step": si,
+                "subject": step.get("subject", ""),
+                "body": step.get("body", ""),
+            })
+        if sample["steps"]:
+            samples.append(sample)
+        if len(samples) >= n:
+            break
+
+    if not samples:
+        return {"campaign_name": name, "leads_in_campaign": len(emails_in_camp),
+                "samples": [],
+                "note": ("Campaign has leads but no per-prospect copy in "
+                          "data/emails/ yet — pipeline hasn't run for these leads. "
+                          "Run launch_pilot first.")}
+    return {"campaign_name": name, "leads_in_campaign": len(emails_in_camp),
+            "samples_returned": len(samples), "samples": samples}
+
+
+def tool_schedule_campaign(args: dict) -> dict:
+    """Move a DRAFTED Smartlead campaign to ACTIVE (status=START). No timing
+    args because Smartlead respects the schedule already configured on the
+    campaign in the UI; this just flips the on switch.
+
+    For complex schedule changes (sending hours, daily caps), use the Smartlead
+    UI — that surface is richer than what we want to recreate here.
+    """
+    from tools.smartlead import SmartleadCLI
+    cid = args["campaign_id"]
+    cli = SmartleadCLI()
+    result = cli.set_status(cid, "START")
+    return {"campaign_id": cid, "new_status": "START", "result": result}
+
+
 def tool_archive_campaign(args: dict) -> dict:
     from tools.smartlead import SmartleadCLI
     cid = args["campaign_id"]
@@ -315,6 +428,23 @@ TOOLS = [
                            "offer": {"type": "string",
                               "description": "power-partner | direct-value | capstone"},
                            "variant": {"type": "string", "default": "A"}}}},
+    {"name": "load_leads_from_smartlead",
+     "description": "Pull leads OUT of an existing Smartlead campaign (by ID) and load them into a lead handle. FREE, no credits consumed. Use when the user says 'use the leads already in Smartlead campaign X' or 'use those existing recruiter leads'. After this, ask the user which target (niche, offer, variant) campaign(s) to launch them into.",
+     "input_schema": {"type": "object", "required": ["campaign_id"],
+                       "properties": {"campaign_id": {"type": ["string", "integer"]},
+                                       "max_n": {"type": "integer"}}}},
+    {"name": "preview_emails",
+     "description": "Render N sample drafted emails for a campaign so the user can spot-check the copy BEFORE flipping the campaign to ACTIVE. Reads from data/emails/. Use when the user wants to see what the actual emails look like (e.g. 'show me 5 examples of email 1 for recruiters-power-partner-A').",
+     "input_schema": {"type": "object", "required": ["campaign_name"],
+                       "properties": {
+                           "campaign_name": {"type": "string"},
+                           "n": {"type": "integer", "default": 5},
+                           "step": {"type": "integer",
+                              "description": "1, 2, or 3 — restrict to one sequence step (default: all 3)"}}}},
+    {"name": "schedule_campaign",
+     "description": "Flip a Smartlead campaign from DRAFTED to ACTIVE (start sending). Smartlead's existing schedule (hours, daily cap) on the campaign is respected — this just flips the on switch. DESTRUCTIVE — only call after explicit user confirm AND only after preview_emails has been shown.",
+     "input_schema": {"type": "object", "required": ["campaign_id"],
+                       "properties": {"campaign_id": {"type": ["string", "integer"]}}}},
     {"name": "archive_campaign",
      "description": "Stop or delete a Smartlead campaign. Destructive — only call after explicit user yes.",
      "input_schema": {"type": "object", "required": ["campaign_id"],
@@ -340,6 +470,9 @@ TOOL_FUNCS = {
     "pull_prospector_saved": tool_pull_prospector_saved,
     "prospect_fetch_confirmed": tool_prospect_fetch_confirmed,
     "launch_pilot": tool_launch_pilot,
+    "load_leads_from_smartlead": tool_load_leads_from_smartlead,
+    "preview_emails": tool_preview_emails,
+    "schedule_campaign": tool_schedule_campaign,
     "archive_campaign": tool_archive_campaign,
     "precreate_campaigns": tool_precreate_campaigns,
 }
@@ -352,6 +485,19 @@ TOOL_FUNCS = {
 SYSTEM_PROMPT = """You are Justin's Cold Email 2.0 orchestrator, talking to him in a Slack channel.
 
 You operate his cold-email machine. He DMs/messages you natural-language requests; you translate them into tool calls.
+
+# Important: how the templates work
+
+When campaigns are pre-created, the Smartlead sequence template has placeholder
+tokens like `{{email_1_subject}}` and `{{email_1_body}}`. These placeholders
+look like a "real template" in the Smartlead UI but they are NOT — the actual
+per-prospect copy lives in each lead's `custom_fields`, written by the Copy
+squad during `launch_pilot`. Smartlead substitutes the placeholders at
+send-time using each lead's custom fields.
+
+So: an empty pre-created campaign with `{{email_1_body}}` showing in the
+Sequences tab is correct and expected. You only see the real generated copy
+after `launch_pilot` runs and after you call `preview_emails`.
 
 # Your operational world
 
@@ -366,16 +512,22 @@ You operate his cold-email machine. He DMs/messages you natural-language request
 1. **CSV upload**: when a user message has files attached, call `ingest_csv_from_slack` with the file_id. Then ask which campaign(s) to load them into and confirm before `launch_pilot`.
 2. **Prospector pull (NL)**: call `pull_prospector_nl` first (FREE search). Show the count + sample. Ask user to confirm `max_fetch` value before calling `prospect_fetch_confirmed` (which spends credits).
 3. **Prospector pull (saved)**: same flow with `pull_prospector_saved`.
-4. **Launch pilot**: after a lead handle exists and the user has named the (niche, offer, variant), confirm explicitly: "Launching N leads into <name>. Confirm?". Then call `launch_pilot`.
-5. **Stats / list / read**: call freely without confirmation — they're read-only.
+4. **Use existing Smartlead leads**: when the user says "use the leads already in Smartlead" or "use those recruiter leads", call `load_leads_from_smartlead` with the source campaign ID. The recruiter list is in one of the existing Smartlead campaigns — call `list_active_campaigns` first if you don't know which campaign holds them.
+5. **Launch pilot**: after a lead handle exists and the user has named the (niche, offer, variant), confirm explicitly: "Launching N leads into <name>. Confirm?". Then call `launch_pilot`.
+6. **Show samples (CRITICAL)**: After every `launch_pilot` completes, AUTOMATICALLY call `preview_emails` for each campaign that received leads, and post 3-5 examples in the thread. The user must always see real generated copy before any campaign moves to ACTIVE.
+7. **Schedule (start sending)**: only after the user has reviewed previews and explicitly approved with words like "looks good, start it" or "send" or "schedule". Then call `schedule_campaign` with the campaign_id. The Smartlead UI's pre-configured schedule (sending hours, daily cap) is respected.
+8. **Stats / list / read / preview**: call freely without confirmation — they're read-only or near-read-only.
 
 # Confirmation gate (CRITICAL)
 
 NEVER call any of these without an explicit user "yes" / "go" / "confirm" / "do it" / "launch" in the most recent user message:
 - `prospect_fetch_confirmed`  (consumes Smartlead credits)
 - `launch_pilot`              (writes to Smartlead, costs LLM tokens)
+- `schedule_campaign`         (starts real outbound email sending)
 - `archive_campaign`          (destructive)
 - `precreate_campaigns`       (writes to Smartlead, costs LLM tokens)
+
+`schedule_campaign` has an EXTRA gate: never call it without first having shown the user `preview_emails` output for that campaign in the same thread. The user must see real copy and explicitly approve before the campaign goes ACTIVE.
 
 If the user's request implies one of these but they haven't confirmed, ASK first. Show them what you're about to do (counts, costs, campaign name) and wait for confirmation in the next message.
 
@@ -405,15 +557,32 @@ async def run_tools(client: anthropic.Anthropic, conversation: list[dict],
             tools=TOOLS,
             messages=conversation,
         )
-        # Append assistant turn (with possible tool_use blocks) to the convo
-        conversation.append({"role": "assistant", "content": msg.content})
+        # Append assistant turn (with possible tool_use blocks) to the convo.
+        # Convert content blocks to plain dicts so the thread file can be
+        # JSON-serialized later (Anthropic SDK returns TextBlock/ToolUseBlock).
+        serialized = []
+        for b in msg.content:
+            t = getattr(b, "type", None)
+            if t == "text":
+                serialized.append({"type": "text", "text": b.text})
+            elif t == "tool_use":
+                serialized.append({"type": "tool_use", "id": b.id,
+                                     "name": b.name, "input": dict(b.input or {})})
+            else:
+                # Fallback: best-effort dict
+                try:
+                    serialized.append(b.model_dump())
+                except Exception:
+                    serialized.append({"type": t or "unknown", "raw": str(b)})
+        conversation.append({"role": "assistant", "content": serialized})
 
         if msg.stop_reason != "tool_use":
             # Final answer; return text content
             text_parts = [b.text for b in msg.content if getattr(b, "type", "") == "text"]
             return "\n".join(text_parts).strip() or "(no response)"
 
-        # Execute tool calls, append results
+        # Execute tool calls, append results — read from the LIVE msg.content
+        # (which has SDK objects), not the serialized copy.
         tool_results = []
         for block in msg.content:
             if getattr(block, "type", "") != "tool_use":
