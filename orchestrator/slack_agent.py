@@ -865,6 +865,79 @@ def tool_preview_emails(args: dict) -> dict:
             "samples_returned": len(samples), "samples": samples}
 
 
+def tool_import_csv_to_smartlead(args: dict) -> dict:
+    """Import a personalized-leads CSV (from data/exports/) directly into a
+    Smartlead campaign with custom_fields populated from email_1/2/3 columns.
+
+    Use after personalize_to_csv produces a CSV. Maps email_1_subject /
+    email_1_body / email_2_subject / etc. to Smartlead custom_fields so the
+    campaign's sequence template substitutes per-prospect copy at send-time.
+
+    args:
+      csv_path:    path under data/exports/ (or absolute)
+      campaign_id: Smartlead campaign id (int or string)
+    """
+    from tools.csv_to_smartlead import import_csv
+    return import_csv(args["csv_path"], args["campaign_id"])
+
+
+def tool_update_campaign_schedule(args: dict) -> dict:
+    """Update the schedule (sending hours, daily cap, start time, timezone)
+    on a Smartlead campaign. Required before flipping DRAFTED → ACTIVE for
+    a campaign that doesn't already have a schedule. After update, call
+    schedule_campaign(campaign_id) to flip it ACTIVE.
+
+    args:
+      campaign_id: Smartlead campaign id
+      timezone:    e.g. 'America/New_York' (default)
+      days_of_week: list of int 1=Mon..7=Sun (default M-F = [1,2,3,4,5])
+      start_hour:  HH:MM (default '08:00')
+      end_hour:    HH:MM (default '17:00')
+      min_time_btw_emails: minutes (default 5)
+      max_new_leads_per_day: int (default 50)
+      schedule_start_iso: absolute UTC ISO timestamp for first allowed send
+                            (default tomorrow at start_hour in timezone)
+    """
+    import datetime as dt
+    import json as _json
+    import tempfile
+    from tools.smartlead import SmartleadCLI
+
+    cid = args["campaign_id"]
+    schedule = {
+        "timezone": args.get("timezone", "America/New_York"),
+        "days_of_the_week": args.get("days_of_week", [1, 2, 3, 4, 5]),
+        "start_hour": args.get("start_hour", "08:00"),
+        "end_hour": args.get("end_hour", "17:00"),
+        "min_time_btw_emails": int(args.get("min_time_btw_emails", 5)),
+        "max_new_leads_per_day": int(args.get("max_new_leads_per_day", 50)),
+    }
+    if args.get("schedule_start_iso"):
+        schedule["schedule_start_time"] = args["schedule_start_iso"]
+    else:
+        # default: tomorrow at start_hour ET → UTC
+        # 08:00 ET in DST = 12:00 UTC. Approx; user can override.
+        tomorrow = (dt.datetime.now(dt.UTC) + dt.timedelta(days=1)).date()
+        schedule["schedule_start_time"] = (
+            f"{tomorrow.isoformat()}T12:00:00.000Z"
+        )
+
+    cli = SmartleadCLI()
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        _json.dump(schedule, fh)
+        body_path = fh.name
+    try:
+        result = cli._run_json(
+            ["campaigns", "update-schedule", "--id", str(cid),
+             "--from-json", body_path])
+    finally:
+        try:
+            os.unlink(body_path)
+        except Exception:
+            pass
+    return {"campaign_id": cid, "schedule_set": schedule, "result": result}
+
+
 def tool_schedule_campaign(args: dict) -> dict:
     """Move a DRAFTED Smartlead campaign to ACTIVE (status=START). No timing
     args because Smartlead respects the schedule already configured on the
@@ -1188,6 +1261,28 @@ TOOLS = [
                               "description": "list of campaign names, e.g. ['recruiters-power-partner-A','recruiters-direct-value-A']"},
                            "n": {"type": "integer", "default": 3,
                               "description": "leads to sample per target (default 3)"}}}},
+    {"name": "import_csv_to_smartlead",
+     "description": "Import a personalized-leads CSV directly into a Smartlead campaign with custom_fields populated from email_1/2/3 subject + body columns. Use after personalize_to_csv produces a CSV that matches an existing campaign's brief. Returns counts: leads_sent / total_leads (added) / duplicate_count / block_count / already_added_to_campaign.",
+     "input_schema": {"type": "object", "required": ["csv_path", "campaign_id"],
+                       "properties": {
+                           "csv_path": {"type": "string"},
+                           "campaign_id": {"type": ["string", "integer"]}}}},
+    {"name": "update_campaign_schedule",
+     "description": "Configure a Smartlead campaign's schedule (sending hours, days, daily cap, timezone, first allowed send time). REQUIRED before flipping a campaign DRAFTED → ACTIVE if it has no schedule yet — otherwise schedule_campaign succeeds but no emails actually send. Defaults: M-F 8am-5pm ET, 50 leads/day, 5 min between emails, first send tomorrow.",
+     "input_schema": {"type": "object", "required": ["campaign_id"],
+                       "properties": {
+                           "campaign_id": {"type": ["string", "integer"]},
+                           "timezone": {"type": "string"},
+                           "days_of_week": {"type": "array",
+                              "items": {"type": "integer",
+                                          "minimum": 1, "maximum": 7}},
+                           "start_hour": {"type": "string",
+                              "description": "HH:MM, default 08:00"},
+                           "end_hour": {"type": "string"},
+                           "min_time_btw_emails": {"type": "integer"},
+                           "max_new_leads_per_day": {"type": "integer"},
+                           "schedule_start_iso": {"type": "string",
+                              "description": "absolute UTC ISO timestamp for first allowed send"}}}},
     {"name": "schedule_campaign",
      "description": "Flip a Smartlead campaign from DRAFTED to ACTIVE (start sending). Smartlead's existing schedule (hours, daily cap) on the campaign is respected — this just flips the on switch. DESTRUCTIVE — only call after explicit user confirm AND only after preview_emails has been shown.",
      "input_schema": {"type": "object", "required": ["campaign_id"],
@@ -1283,6 +1378,8 @@ TOOL_FUNCS = {
     "preview_emails": tool_preview_emails,
     "generate_preview_pack": tool_generate_preview_pack,
     "schedule_campaign": tool_schedule_campaign,
+    "import_csv_to_smartlead": tool_import_csv_to_smartlead,
+    "update_campaign_schedule": tool_update_campaign_schedule,
     "update_voice_rules": tool_update_voice_rules,
     "update_brief": tool_update_brief,
     "log_capability_gap": tool_log_capability_gap,
