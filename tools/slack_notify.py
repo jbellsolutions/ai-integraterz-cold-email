@@ -171,6 +171,60 @@ class SlackClient:
         dest_path.write_bytes(r.content)
         return dest_path
 
+    def upload_file(self, channel: str, file_path,
+                       title: str | None = None,
+                       initial_comment: str | None = None,
+                       thread_ts: str | None = None,
+                       filename: str | None = None) -> dict:
+        """Upload a file to Slack using the files.upload_v2 flow:
+          1. files.getUploadURLExternal  → returns upload_url + file_id
+          2. POST file bytes to that upload_url
+          3. files.completeUploadExternal → attaches to channel/thread
+
+        The legacy `files.upload` endpoint is deprecated as of 2025-03; v2 is
+        the only path that works for new bot tokens. Requires `files:write`
+        scope on the bot.
+        """
+        from pathlib import Path
+        p = Path(file_path)
+        size = p.stat().st_size
+        name = filename or p.name
+
+        # Step 1: get an upload URL
+        params = {"filename": name, "length": str(size)}
+        if title:
+            params["alt_txt"] = title[:1000]
+        r = self.client.get(
+            "https://slack.com/api/files.getUploadURLExternal",
+            headers={"Authorization": f"Bearer {self.bot_token}"},
+            params=params,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"getUploadURLExternal failed: {data.get('error')}")
+        upload_url = data["upload_url"]
+        file_id = data["file_id"]
+
+        # Step 2: POST raw bytes (multipart, with file= field)
+        with p.open("rb") as fh:
+            up = self.client.post(upload_url, files={"file": (name, fh)})
+        up.raise_for_status()
+
+        # Step 3: complete + attach to channel
+        complete_payload: dict = {
+            "files": [{"id": file_id, "title": title or name}],
+            "channel_id": channel,
+        }
+        if initial_comment:
+            complete_payload["initial_comment"] = initial_comment
+        if thread_ts:
+            complete_payload["thread_ts"] = thread_ts
+        return self._post_json(
+            "https://slack.com/api/files.completeUploadExternal",
+            complete_payload,
+        )
+
     def file_info(self, file_id: str) -> dict:
         """files.info → {url_private, name, mimetype, ...}."""
         r = self._get("https://slack.com/api/files.info", params={"file": file_id})

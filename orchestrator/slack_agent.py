@@ -383,6 +383,234 @@ def tool_load_leads_from_smartlead(args: dict) -> dict:
             "summary": lead_summary(leads)}
 
 
+def tool_personalize_to_csv(args: dict) -> dict:
+    """Run Strategy → Research → Copy on a lead handle and post a CSV to Slack
+    with personalized email_1/2/3 subject + body per prospect. NO Smartlead
+    writes — Justin imports the CSV himself.
+
+    This is the simplest, most-reliable path: leads in, CSV out. It removes the
+    entire Smartlead-write half of the pipeline (and that half's failure modes:
+    auth issues, idempotent-lookup races, custom-field mapping mismatches,
+    silent template-token uploads). Same Strategy + Research + Copy stages as
+    launch_pilot, with the same hard-fail-on-empty guard.
+
+    args:
+      lead_handle: handle from ingest_csv_from_slack / load_leads_from_smartlead /
+                    prospect_fetch_confirmed
+      niche, offer, variant: which cached brief to use (selects the campaign's
+                                voice + framing). Same values as launch_pilot.
+      filename:    optional CSV filename (default: <campaign>-<ts>.csv)
+
+    The CSV columns are Smartlead-import-compatible:
+      email, first_name, last_name, company_name, title, linkedin_url,
+      email_1_subject, email_1_body, email_2_subject, email_2_body,
+      email_3_subject, email_3_body, slop_pass, signal_tier
+    """
+    from orchestrator.main import REPO_ROOT as RR  # avoid stale import on reload
+    from squads.copy import CopySquad
+    from squads.research import ResearchSquad
+    from squads.strategy import StrategySquad
+    from squads.smartlead.squad import make_campaign_name
+
+    handle = args["lead_handle"]
+    niche = args.get("niche")
+    offer = args["offer"]
+    variant = args.get("variant", "A")
+    if handle not in LEAD_HANDLES:
+        return {"error": f"unknown lead_handle '{handle}' — call ingest or fetch first"}
+    leads = LEAD_HANDLES[handle]["leads"]
+    source = LEAD_HANDLES[handle]["source"]
+    n = len(leads)
+    campaign_name = make_campaign_name(niche, offer, variant)
+
+    sc = SlackClient()
+    channel = os.environ.get("SLACK_CONTROL_CHANNEL", "#cold-email-control")
+    thread_ts = args.get("_thread_ts")
+
+    # Throttled progress callback — same shape as launch_pilot
+    last_msg = {"key": ""}
+    def progress_post(stage: str, done: int, total: int, detail: str = ""):
+        key = f"{stage}:{done // 100}" if stage == "copy" else f"{stage}:{done}"
+        if key == last_msg["key"]:
+            return
+        last_msg["key"] = key
+        msg = (f":hourglass_flowing_sand: `{campaign_name}` (CSV) · "
+                f"*{stage}* {done}/{total}" + (f" · {detail}" if detail else ""))
+        try:
+            sc.post(channel, msg, thread_ts=thread_ts)
+        except Exception as e:
+            print(f"[personalize_to_csv] progress post failed: {e}", flush=True)
+
+    async def _runner():
+        import csv
+        from squads.research.squad import Lead
+
+        # 1. Strategy brief (cached per campaign, same as launch_pilot)
+        brief_dir = REPO_ROOT / "data" / "campaigns" / campaign_name
+        brief_dir.mkdir(parents=True, exist_ok=True)
+        brief_path = brief_dir / "brief.md"
+        if brief_path.exists():
+            brief = brief_path.read_text()
+            progress_post("strategy", 1, 1, "cached")
+        else:
+            progress_post("strategy", 0, 1, "generating brief")
+            from tools.lead_loader import lead_summary
+            strategy = StrategySquad()
+            brief = await strategy.build_brief(offer, lead_summary(leads),
+                                                  niche=niche, variant=variant)
+            brief_path.write_text(brief)
+            progress_post("strategy", 1, 1, f"{len(brief)} chars")
+
+        # 2. Research (concurrent, configurable)
+        research_parallel = int(os.environ.get("CE2_RESEARCH_PARALLEL", "30"))
+        progress_post("research", 0, n, f"max_parallel={research_parallel}")
+        research = ResearchSquad(brief=brief)
+        t0 = dt.datetime.utcnow()
+        signals = await research.research_batch(leads, max_parallel=research_parallel)
+        r_dt = (dt.datetime.utcnow() - t0).total_seconds()
+        progress_post("research", n, n, f"{r_dt:.0f}s")
+
+        # 3. Copy (concurrent)
+        copy_parallel = int(os.environ.get("CE2_COPY_PARALLEL", "20"))
+        progress_post("copy", 0, n, f"max_parallel={copy_parallel}")
+        copy = CopySquad(brief=brief)
+        sem = asyncio.Semaphore(copy_parallel)
+        done = {"n": 0}
+        last = {"t": dt.datetime.utcnow()}
+
+        async def write_one(lead, signal):
+            async with sem:
+                try:
+                    return await copy.write_one(lead, signal)
+                except Exception as e:
+                    print(f"[personalize_to_csv] copy failed for {lead.email}: {e}",
+                            flush=True)
+                    return {"sequence": [], "slop_pass": False, "error": str(e)}
+                finally:
+                    done["n"] += 1
+                    now = dt.datetime.utcnow()
+                    if (done["n"] % 25 == 0 or
+                            (now - last["t"]).total_seconds() > 30):
+                        progress_post("copy", done["n"], n, "")
+                        last["t"] = now
+
+        c_t0 = dt.datetime.utcnow()
+        emails = await asyncio.gather(*(write_one(l, s)
+                                          for l, s in zip(leads, signals)))
+        c_dt = (dt.datetime.utcnow() - c_t0).total_seconds()
+        slop_pass = sum(1 for e in emails if e.get("slop_pass"))
+        progress_post("copy", n, n, f"{c_dt:.0f}s · {slop_pass}/{n} clean")
+
+        # 4. Filter empty rows + write CSV
+        exports_dir = REPO_ROOT / "data" / "exports"
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        filename = args.get("filename") or f"{campaign_name}-{ts}.csv"
+        if not filename.endswith(".csv"):
+            filename += ".csv"
+        out_path = exports_dir / filename
+
+        cols = [
+            "email", "first_name", "last_name", "company_name", "title",
+            "linkedin_url",
+            "email_1_subject", "email_1_body",
+            "email_2_subject", "email_2_body",
+            "email_3_subject", "email_3_body",
+            "slop_pass", "signal_tier",
+        ]
+        rows_written = 0
+        rows_skipped_empty = 0
+        with out_path.open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols, quoting=csv.QUOTE_ALL)
+            w.writeheader()
+            for lead, email_obj, signal in zip(leads, emails, signals):
+                seq = email_obj.get("sequence") or []
+                step1 = next((s for s in seq if s.get("step") == 1), None)
+                step2 = next((s for s in seq if s.get("step") == 2), None)
+                step3 = next((s for s in seq if s.get("step") == 3), None)
+                # Drop prospects whose step 1 is empty — same standard as
+                # launch_pilot's hard-fail, but here we drop the row (the CSV
+                # is partially-recoverable; the campaign upload was not).
+                if not step1 or not (step1.get("body") or "").strip():
+                    rows_skipped_empty += 1
+                    continue
+                full = (lead.name or "")
+                first, _, last = full.partition(" ")
+                w.writerow({
+                    "email": lead.email or "",
+                    "first_name": first,
+                    "last_name": last,
+                    "company_name": lead.company or "",
+                    "title": lead.title or "",
+                    "linkedin_url": getattr(lead, "linkedin_url", "") or "",
+                    "email_1_subject": (step1.get("subject") or "") if step1 else "",
+                    "email_1_body": (step1.get("body") or "") if step1 else "",
+                    "email_2_subject": (step2.get("subject") or "") if step2 else "",
+                    "email_2_body": (step2.get("body") or "") if step2 else "",
+                    "email_3_subject": (step3.get("subject") or "") if step3 else "",
+                    "email_3_body": (step3.get("body") or "") if step3 else "",
+                    "slop_pass": "1" if email_obj.get("slop_pass") else "0",
+                    "signal_tier": signal.get("tier", "") if signal else "",
+                })
+                rows_written += 1
+
+        # 5. Upload CSV to Slack (file attachment in the thread)
+        total_dt = (dt.datetime.utcnow() - t0).total_seconds()
+        comment = (
+            f":white_check_mark: *Personalized CSV ready* — `{campaign_name}`\n"
+            f"  • Source: {source}  ({n} leads in)\n"
+            f"  • CSV rows: {rows_written}  (skipped {rows_skipped_empty} empty-copy)\n"
+            f"  • Slop-clean: {slop_pass}/{n}\n"
+            f"  • Times: research {r_dt:.0f}s · copy {c_dt:.0f}s · "
+            f"*total {total_dt:.0f}s*\n"
+            f"  • Smartlead import: drag this CSV into a campaign's *Add Leads → "
+            f"Upload CSV*. Map `email_1_subject` / `email_1_body` etc. to "
+            f"custom fields on first import; mappings persist after that."
+        )
+        sc.upload_file(channel, out_path,
+                         title=f"{campaign_name} personalized leads",
+                         initial_comment=comment,
+                         thread_ts=thread_ts)
+
+    task_id = _new_handle("personalize")
+    task = asyncio.create_task(_runner())
+
+    def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            sc.post(channel, f":x: `{campaign_name}` (CSV) was *cancelled*",
+                     thread_ts=thread_ts)
+            return
+        exc = t.exception()
+        if exc is None:
+            return
+        import traceback as tb
+        err = "".join(tb.format_exception(type(exc), exc, exc.__traceback__))
+        tail = err[-1500:]
+        try:
+            sc.post(channel,
+                      f":x: *personalize_to_csv FAILED* — `{campaign_name}`\n"
+                      f"```\n{tail}\n```",
+                      thread_ts=thread_ts)
+        except Exception as post_e:
+            print(f"[personalize_to_csv] failed to post error: {post_e}\n"
+                   f"{err}", flush=True)
+        try:
+            crash_dir = REPO_ROOT / "data" / "exports"
+            crash_dir.mkdir(parents=True, exist_ok=True)
+            (crash_dir / f"CRASH-{campaign_name}-"
+                f"{dt.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.txt"
+            ).write_text(err)
+        except Exception:
+            pass
+
+    task.add_done_callback(_on_done)
+    RUNNING_PILOTS[task_id] = task
+    return {"started": True, "task_id": task_id, "leads": n,
+            "campaign": campaign_name,
+            "note": ("Personalizing in background. Progress will post here. "
+                       "When done, I'll upload the CSV as a file in this thread.")}
+
+
 def tool_preview_emails(args: dict) -> dict:
     """Render N sample drafted emails (subject + body for sequence 1/2/3) for a
     given campaign so the user can spot-check copy quality before sending.
@@ -748,6 +976,18 @@ TOOLS = [
                            "offer": {"type": "string",
                               "description": "power-partner | direct-value | capstone"},
                            "variant": {"type": "string", "default": "A"}}}},
+    {"name": "personalize_to_csv",
+     "description": "PREFERRED PATH for getting personalized emails to Justin fast. Run Strategy + Research + Copy on a lead handle and post a CSV file to this Slack thread with email_1/2/3 subject + body per prospect. NO Smartlead writes — Justin imports the CSV himself in the Smartlead UI. Use this when the user says 'personalize these leads', 'just give me the CSV', 'I'll upload to Smartlead myself', or any time reliability matters more than the integrated pipeline. Same hard-fail-on-empty guard as launch_pilot. ~2-5 min for a few hundred leads, ~25-35 min for 5,000. Posts progress as research/copy advance.",
+     "input_schema": {"type": "object",
+                       "required": ["lead_handle", "offer"],
+                       "properties": {
+                           "lead_handle": {"type": "string"},
+                           "niche": {"type": "string"},
+                           "offer": {"type": "string",
+                              "description": "power-partner | direct-value | capstone — selects the cached brief"},
+                           "variant": {"type": "string", "default": "A"},
+                           "filename": {"type": "string",
+                              "description": "optional CSV filename (default: <campaign>-<timestamp>.csv)"}}}},
     {"name": "load_leads_from_smartlead",
      "description": "Pull leads OUT of an existing Smartlead campaign (by ID) and load them into a lead handle. FREE, no credits consumed. Use when the user says 'use the leads already in Smartlead campaign X' or 'use those existing recruiter leads'. After this, ask the user which target (niche, offer, variant) campaign(s) to launch them into.",
      "input_schema": {"type": "object", "required": ["campaign_id"],
@@ -824,6 +1064,7 @@ TOOL_FUNCS = {
     "pull_prospector_saved": tool_pull_prospector_saved,
     "prospect_fetch_confirmed": tool_prospect_fetch_confirmed,
     "launch_pilot": tool_launch_pilot,
+    "personalize_to_csv": tool_personalize_to_csv,
     "load_leads_from_smartlead": tool_load_leads_from_smartlead,
     "preview_emails": tool_preview_emails,
     "generate_preview_pack": tool_generate_preview_pack,
@@ -871,7 +1112,10 @@ after `launch_pilot` runs and after you call `preview_emails`.
 2. **Prospector pull (NL)**: call `pull_prospector_nl` first (FREE search). Show the count + sample. Ask user to confirm `max_fetch` value before calling `prospect_fetch_confirmed` (which spends credits).
 3. **Prospector pull (saved)**: same flow with `pull_prospector_saved`.
 4. **Use existing Smartlead leads**: when the user says "use the leads already in Smartlead" or "use those recruiter leads", call `load_leads_from_smartlead` with the source campaign ID. The recruiter list is in one of the existing Smartlead campaigns — call `list_active_campaigns` first if you don't know which campaign holds them.
-5. **Launch pilot**: after a lead handle exists and the user has named the (niche, offer, variant), confirm explicitly: "Launching N leads into <name>. Confirm?". Then call `launch_pilot`.
+5. **Launch pilot vs personalize-to-CSV (CRITICAL DEFAULT)**: there are TWO paths to personalized emails. PREFER `personalize_to_csv` UNLESS Justin explicitly asks you to push to Smartlead.
+   - `personalize_to_csv` (PREFERRED, faster, more reliable): runs Strategy + Research + Copy, drops a CSV file into the Slack thread. Justin uploads to Smartlead himself. No Smartlead-write failure modes.
+   - `launch_pilot` (legacy, more failure surface): same pipeline + writes leads with custom_fields directly to a pre-created Smartlead campaign.
+   When Justin says "personalize these leads", "give me the CSV", "I'll upload myself", or simply "do it" / "go" without specifying — DEFAULT to `personalize_to_csv`. Confirm explicitly: "Personalizing N leads using `<niche>-<offer>-<VARIANT>` brief, will post CSV when done (~X min). Confirm?". Then call.
 6. **Show samples (CRITICAL)**: After every `launch_pilot` completes, AUTOMATICALLY call `preview_emails` for each campaign that received leads, and post 3-5 examples in the thread. The user must always see real generated copy before any campaign moves to ACTIVE.
 7. **Schedule (start sending)**: only after the user has reviewed previews and explicitly approved with words like "looks good, start it" or "send" or "schedule". Then call `schedule_campaign` with the campaign_id. The Smartlead UI's pre-configured schedule (sending hours, daily cap) is respected.
 8. **Stats / list / read / preview**: call freely without confirmation — they're read-only or near-read-only.
@@ -905,6 +1149,7 @@ after `launch_pilot` runs and after you call `preview_emails`.
 NEVER call any of these without an explicit user "yes" / "go" / "confirm" / "do it" / "launch" in the most recent user message:
 - `prospect_fetch_confirmed`  (consumes Smartlead credits)
 - `launch_pilot`              (writes to Smartlead, costs LLM tokens)
+- `personalize_to_csv`        (costs LLM tokens — research + copy on every lead)
 - `schedule_campaign`         (starts real outbound email sending)
 - `archive_campaign`          (destructive)
 - `precreate_campaigns`       (writes to Smartlead, costs LLM tokens)
