@@ -951,6 +951,31 @@ async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str)
     return n
 
 
+async def heartbeat_loop(slack: SlackClient, channel: str,
+                            interval_seconds: int = 1800) -> None:
+    """Post a quiet status line to the channel every N minutes so the user
+    can see at a glance that the daemon is alive. Defaults to 30 min.
+    Crashes inside this coroutine are logged but never propagate (the
+    heartbeat must never take down the agent itself)."""
+    started_at = dt.datetime.utcnow()
+    counter = 0
+    while True:
+        await asyncio.sleep(interval_seconds)
+        counter += 1
+        try:
+            up = dt.datetime.utcnow() - started_at
+            hrs = int(up.total_seconds() // 3600)
+            mins = int((up.total_seconds() % 3600) // 60)
+            uptime = f"{hrs}h{mins:02d}m"
+            cursor_data = _load_cursor()
+            cursor_ts = cursor_data.get(channel, "")
+            slack.post(channel,
+                f":heartbeat: alive · uptime *{uptime}* · "
+                f"cursor `{cursor_ts[:13]}` · pulse #{counter}")
+        except Exception as e:
+            print(f"[heartbeat] error (suppressed): {e}", flush=True)
+
+
 async def watch(channel: str, interval: int, once: bool, announce: bool = True) -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     THREADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -979,6 +1004,12 @@ async def watch(channel: str, interval: int, once: bool, announce: bool = True) 
         # Slack ts is unix-seconds.microseconds string
         cursor[channel] = f"{dt.datetime.utcnow().timestamp():.6f}"
         _save_cursor(cursor)
+
+    # Background heartbeat — posts a status line every 30 min.
+    if not once:
+        hb_interval = int(os.environ.get("CE2_HEARTBEAT_SECONDS", "1800"))
+        if hb_interval > 0:
+            asyncio.create_task(heartbeat_loop(slack, channel, hb_interval))
 
     while True:
         try:

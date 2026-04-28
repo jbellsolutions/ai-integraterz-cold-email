@@ -229,7 +229,7 @@ class CopySquad:
             # also re-roll the hook with the violation feedback.
             sequence = await self._draft_body(lead, signal, hook,
                                                 previous_violations=all_violations or None)
-            seq_list = _safe_list(sequence.get("sequence"))
+            seq_list = _clean_sequence(_safe_list(sequence.get("sequence")))
             full_text = "\n".join((e.get("subject") or "") + "\n" + (e.get("body") or "") for e in seq_list)
 
             slop_pass, slop_hits = slop_check(full_text)
@@ -337,6 +337,39 @@ class CopySquad:
         out_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^a-zA-Z0-9]+", "_", lead.email)
         (out_dir / f"{safe}.json").write_text(json.dumps(out, indent=2))
+
+
+def _strip_em_dashes(text: str, keep: int = 1) -> str:
+    """The body model loves em-dashes; >1 in a sequence reads ChatGPT-rhythm.
+    Keep up to `keep` em-dashes (preserves natural prose where one works),
+    replace the rest with periods + space. Trailing whitespace cleaned."""
+    if not text:
+        return text
+    parts = text.split("—")
+    if len(parts) <= keep + 1:
+        return text  # already at or below threshold
+    # Stitch: first `keep+1` parts joined with em-dash, the rest with ". "
+    head = "—".join(parts[: keep + 1])
+    tail = ". ".join(p.strip() for p in parts[keep + 1:])
+    cleaned = head + ". " + tail
+    # Tidy double spaces / period-space-period artifacts
+    cleaned = re.sub(r"\s+\.", ".", cleaned)
+    cleaned = re.sub(r"\.\s*\.", ".", cleaned)
+    cleaned = re.sub(r"  +", " ", cleaned)
+    # Re-capitalize first letter after ". " when we just split a clause
+    cleaned = re.sub(r"(\.\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), cleaned)
+    return cleaned
+
+
+def _clean_sequence(seq_list: list[dict]) -> list[dict]:
+    """Apply post-hoc cleanups across the sequence: strip excess em-dashes
+    per email body. Keeps prose natural; strips ChatGPT rhythm tells."""
+    out = []
+    for step in seq_list:
+        cleaned = dict(step)
+        cleaned["body"] = _strip_em_dashes(step.get("body", "") or "", keep=1)
+        out.append(cleaned)
+    return out
 
 
 def _safe_list(v) -> list:

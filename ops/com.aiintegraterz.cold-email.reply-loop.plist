@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- launchd supervisor for the Smartlead reply-handling daemon.
+         Same shape as slack-agent.plist; see that file for usage notes. -->
+
+    <key>Label</key>
+    <string>com.aiintegraterz.cold-email.reply-loop</string>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/ops/run-with-env.sh</string>
+        <string>__REPO__/.venv/bin/python</string>
+        <string>-u</string>
+        <string>-m</string>
+        <string>orchestrator.reply_loop</string>
+        <string>--interval=60</string>
+        <string>--angle=power-partner</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/reply_loop.launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/reply_loop.launchd.log</string>
+</dict>
+</plist>

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- macOS launchd supervisor for the Slack-driven orchestrator agent.
+         Install:   ./ops/install.sh
+         Manual:    cp this file → ~/Library/LaunchAgents/
+                    launchctl load ~/Library/LaunchAgents/com.aiintegraterz.cold-email.slack-agent.plist
+         Status:    launchctl list | grep cold-email
+         Stop:      launchctl unload ~/Library/LaunchAgents/com.aiintegraterz.cold-email.slack-agent.plist
+
+         Behavior:
+         - RunAtLoad: starts on user login (after launchctl load)
+         - KeepAlive: launchd auto-restarts the daemon if it exits for any reason
+         - ProcessType: Adaptive — keeps the daemon awake
+         - ThrottleInterval: minimum 30s between restarts (prevents crash-loop hammering) -->
+
+    <key>Label</key>
+    <string>com.aiintegraterz.cold-email.slack-agent</string>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <!-- The wrapper sources .env so the daemon picks up ANTHROPIC_API_KEY,
+         SLACK_BOT_TOKEN, SMARTLEAD_API_KEY, SLACK_CONTROL_CHANNEL etc. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/ops/run-with-env.sh</string>
+        <string>__REPO__/.venv/bin/python</string>
+        <string>-u</string>
+        <string>-m</string>
+        <string>orchestrator.slack_agent</string>
+        <string>--no-announce</string>
+    </array>
+
+    <!-- Load .env into the process environment via a wrapper script -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Adaptive</string>
+
+    <key>StandardOutPath</key>
+    <string>__REPO__/logs/slack_agent.launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__REPO__/logs/slack_agent.launchd.log</string>
+</dict>
+</plist>
