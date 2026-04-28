@@ -6,11 +6,11 @@ Honest engineering answer.
 
 ## The vocabulary
 
-**Forge** is *our internal multi-agent harness library*. It's a Python coordinator: it spawns several Anthropic API calls in parallel, applies a consensus algorithm to their outputs, and persists results. It's useful — that's why we use it for the Strategy / Research / Copy / Reply squads — but it's *not* AGI, it's *not* a brain, and it has no opinion about "always on."
+**Forge** is *our internal multi-agent harness library*. It's a Python coordinator: it spawns several Anthropic API calls in parallel, applies a consensus algorithm to their outputs, and persists results. It's useful — that's why we use it for the Strategy / Research / Copy / Reply squads — but Forge alone is a coordinator, not a self-improving system.
 
-**Hermes** isn't part of this stack. (You may be thinking of Nous Research's Hermes models, or the Greek mythology messenger; neither is in our system.) Even if we added a different LLM, that wouldn't fix uptime — uptime is infrastructure, not model choice.
+**AGI-1** *is* real and Justin has it installed globally — see `AGI1_INTEGRATION.md` in this repo. AGI-1 (v2.2.1, at `~/Desktop/Rethinking Repo's/agi-1/`) provides the self-healing/self-learning layer with 17 skills (auditor, healer, learner, council, etc.) and an 8-phase audit-and-improve pipeline. It is *not yet bootstrapped on this repo* — that's the gap to close. Earlier drafts of this document dismissed it as marketing; that was wrong.
 
-**AGI** isn't real here either. We use Anthropic's Claude API. The agent is a Python process that calls Claude with a tool-use loop. There's no autonomous, self-aware, always-thinking entity — there's a script that wakes up every 8 seconds, checks Slack for new messages, and responds to them.
+**Hermes** isn't part of this stack. Even if we added a different LLM, that wouldn't fix uptime — uptime is infrastructure, not model choice.
 
 ## What "always on" actually means and what it costs
 
@@ -90,9 +90,10 @@ That gets you: auto-restart on crash + survives terminal close + survives lid op
 
 ## The harder, deeper truth
 
-The framing *"AGI on the forge should be making this always on, intelligent, self-improving"* conflates two unrelated things:
+The framing *"AGI on the forge should be making this always on, intelligent, self-improving"* breaks into three layers — and Justin was right that one of them was missing:
 
-- **Capability** — what the agent can do per turn. This is the LLM (Claude), the tools you've registered, the prompts you've written. It IS getting better as we ship more tools and tighter prompts. The voice rules, the validators, the preview pack, the update_brief / update_voice_rules tools — all real capability work.
-- **Availability** — whether a process is running and listening. This is plain process supervision, networking, and OS lifecycle. None of it is AI; it's plumbing. The plumbing has been weak; today we shipped the watchdog which is the right first move.
+- **Capability** — what the agent can do per turn. This is Claude + registered tools + prompts. Improved a lot this session (voice rules, validators, preview pack, update_brief / update_voice_rules tools).
+- **Availability** — whether a process is running and listening. Plumbing. Now solid (watchdog) for crashes, one Login Items click from being solid for reboots.
+- **Self-improvement** — does the system learn from each fix and apply lessons next time without you re-prompting? *This is what AGI-1 is for, and it's not yet wired into this repo.* See `AGI1_INTEGRATION.md` for the bootstrap path.
 
-Forge is fine. Claude is fine. The bug-fixing IS happening (every silent crash this morning has a regression test now). What was broken was the supervisor layer. That's now fixed for crashes, and one Login Items click away from being fixed for restarts.
+Forge is fine. Claude is fine. Watchdog is fine. The next real upgrade is bootstrapping AGI-1 on this repo so the bug-fix cycles compound into system memory.
