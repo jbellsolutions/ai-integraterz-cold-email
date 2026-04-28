@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0.0",
+  "project_name": "cold-email-2",
+  "description": "Opus-orchestrated multi-agent system that turns lead lists into personalized 3-email Smartlead campaigns and manages replies. Operated through Slack: #cold-email-control for outbound, #cold-email-replies for reply approval. Single-tenant, single-operator.",
+  "key_components": [
+    "orchestrator/slack_agent.py — Slack-driven daemon (17 tools, polling)",
+    "orchestrator/reply_loop.py — Smartlead inbox poller + reply triage/draft/approve",
+    "squads/{strategy,research,copy,smartlead,reply}/ — forge multi-agent wrappers",
+    "tools/{slack_notify,smartlead,lead_loader,prospect_filters}.py — external integrations",
+    "ops/watchdog.sh — bash supervisor (15s interval, 30s crash-loop throttle)",
+    "data/voice_rules.md + per-campaign briefs at data/campaigns/<name>/brief.md"
+  ],
+  "language": "python",
+  "fragile_areas": [
+    "LLM JSON output null-handling (squads/copy/squad.py _safe_list, _pick_candidate)",
+    "Smartlead CLI --all flag is broken (returns []) — paginated manually in tools/smartlead.py:list_campaign_leads",
+    "Slack TextBlock JSON serialization in orchestrator/slack_agent.py:run_tools",
+    "In-memory LEAD_HANDLES + RUNNING_PILOTS (orchestrator/slack_agent.py:47-49) — lost on restart",
+    "Cursor advances before handle_message completes (orchestrator/slack_agent.py:poll_once)"
+  ],
+  "entry_points": [
+    "python -m orchestrator.main --smoke",
+    "python -m orchestrator.main --slack-agent",
+    "python -m orchestrator.main --watch-replies",
+    "ops/watchdog.sh",
+    "python -m orchestrator.precreate",
+    "python -m orchestrator.cleanup --archive-existing"
+  ],
+  "repo_path": "/Users/home/Desktop/AI INtegraterz GTM/Cold Email 2.0",
+  "generated": "2026-04-28"
+}

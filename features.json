@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0.0",
+  "project": "cold-email-2",
+  "version": "0.1.0",
+  "capabilities": {
+    "lead_intake": {
+      "csv_upload": true,
+      "smartlead_prospector_saved_search": true,
+      "smartlead_prospector_natural_language": true,
+      "load_from_existing_smartlead_campaign": true
+    },
+    "campaign_management": {
+      "niche_offer_variant_axis": true,
+      "idempotent_lookup_or_create": true,
+      "brief_caching_per_campaign": true,
+      "lazy_creation_on_first_lead_batch": true,
+      "pre_creation": true,
+      "scheduling_via_smartlead_ui": true,
+      "schedule_via_tool": true
+    },
+    "copy_generation": {
+      "hook_squad": "anthropic-sonnet",
+      "body_squad": "anthropic-haiku",
+      "validators": ["slop_check", "sales_check", "url_check", "threading_check"],
+      "retry_with_violation_feedback": true,
+      "max_retries": 3,
+      "voice_rules_loaded_per_call": true
+    },
+    "reply_handling": {
+      "polling_interval_seconds": 60,
+      "auto_handle_classes": ["unsubscribe", "ooo", "spam"],
+      "human_approval_classes": ["positive", "objection", "question", "soft_no"],
+      "url_allowlist_enforcement": true,
+      "thread_reply_protocol": true
+    },
+    "operator_interface": {
+      "slack_control_channel": true,
+      "slack_replies_channel": true,
+      "csv_upload_via_slack": true,
+      "natural_language_routing": true,
+      "visual_reactions": ["eyes", "white_check_mark", "x"],
+      "heartbeat_interval_minutes": 30,
+      "destructive_action_confirmation": true
+    },
+    "supervision": {
+      "watchdog_supervisor": true,
+      "watchdog_interval_seconds": 15,
+      "crash_loop_throttle_seconds": 30,
+      "launchd_plists_provided": true,
+      "launchd_blocked_by_macos_tcc_in_desktop": true,
+      "auto_emit_errors_to_slack": true
+    },
+    "learning": {
+      "regression_tests": true,
+      "test_count": 5,
+      "capability_gap_log": "data/skill_gaps.jsonl",
+      "agi_1_integration": true,
+      "voice_rules_self_edit": true,
+      "brief_self_edit": true
+    }
+  },
+  "external_dependencies": {
+    "anthropic": ">=0.40",
+    "smartlead_cli": "@smartlead/cli (npm, global)",
+    "forge": "github:jbellsolutions/forge",
+    "slack_bot_token": "xoxb-... (chat:write, channels:history, files:read, reactions:write)",
+    "python": "3.13"
+  },
+  "pre_created_campaigns": [
+    "recruiters-power-partner-A",
+    "recruiters-power-partner-B",
+    "recruiters-direct-value-A",
+    "recruiters-direct-value-B",
+    "recruiters-capstone-A",
+    "recruiters-capstone-B"
+  ]
+}

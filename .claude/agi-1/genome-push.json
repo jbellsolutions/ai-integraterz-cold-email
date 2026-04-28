@@ -1,0 +1,12 @@
+{
+  "timestamp": "2026-04-28T18:03:55Z",
+  "candidates_submitted": 3,
+  "promoted_to_genome": 0,
+  "parked_in_pending": 3,
+  "reason": "Confidence gate satisfied (3/3 ≥ 0.8) but fix-count gate not yet (≤2 fixes per pattern; threshold is 5+). Patterns will auto-promote when other repos hit the same patterns and apply the same fix.",
+  "pending_pattern_ids": [
+    "llm-json-null-default-pattern",
+    "validator-violation-feedback-retry",
+    "watchdog-tcc-aware-bash-supervisor"
+  ]
+}

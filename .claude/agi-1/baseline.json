@@ -1,0 +1,15 @@
+{
+  "timestamp": "2026-04-28T17:44:50Z",
+  "gstack_score": 38,
+  "ai_readiness_score": 10,
+  "healing_learning_score": 4,
+  "combined_score": 52,
+  "iteration": 0,
+  "gaps_top_5": [
+    "no CLAUDE.md — blocks every Context File subscore (-13)",
+    "no .claude/ directory — blocks all Automation & Safety (-20) and most Repo Structure (-16)",
+    "no SKILL.md anywhere — blocks all Skill Quality (-25)",
+    "no .claude/healing/ + healer hooks — blocks Healing System (-20)",
+    "no .claude/learning/ — blocks Learning System (-20)"
+  ]
+}

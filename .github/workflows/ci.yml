@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Create venv + install
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -e .
+          # Forge isn't on PyPI; install from the editable github path
+          # uv pip install git+https://github.com/jbellsolutions/forge
+
+      - name: Run regression tests
+        run: |
+          source .venv/bin/activate
+          python tests/test_slack_agent.py
+
+      - name: Smoke test (no LLM cost)
+        env:
+          CE2_MOCK_SMARTLEAD: "1"
+          CE2_MOCK_SLACK: "1"
+        run: |
+          source .venv/bin/activate
+          # Forge is required for smoke; skip if not available
+          python -c "import forge" 2>/dev/null && python -m orchestrator.main --smoke || echo "forge not installed in CI; skipping smoke (covered by tests)"

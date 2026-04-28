@@ -1,0 +1,61 @@
+# Cold Email 2.0 — for LLMs
+
+> Multi-agent system that turns lead lists into personalized 3-email Smartlead campaigns. Operated through Slack. Single-tenant.
+
+## Architecture
+
+Four squads built on the [forge](https://github.com/jbellsolutions/forge) multi-agent harness:
+
+- **Strategy** (Opus 4.7, 1M ctx) → builds campaign brief, runs once per (niche, offer, variant), cached
+- **Research** (Haiku × N parallel) → per-prospect signal mining
+- **Copy** (Sonnet hook + Haiku body + 4 validators with retry) → 3-email sequence per prospect
+- **Smartlead** (deterministic) → idempotent campaign create-or-append + per-prospect custom fields
+
+Two daemons, supervised by `ops/watchdog.sh`:
+- **slack_agent** polls `#cold-email-control` every 8s, runs Anthropic tool-use over 17 tools
+- **reply_loop** polls Smartlead inbox every 60s, drafts responses through the Reply Squad, posts to `#cold-email-replies` for operator approval
+
+## Key files
+
+- [README.md](README.md) — quickstart + architecture
+- [OPERATIONS.md](OPERATIONS.md) — daily operator runbook
+- [CLAUDE.md](CLAUDE.md) — project context for Claude Code
+- [ETHOS.md](ETHOS.md) — what this repo will always / never do
+- [ARCHITECTURE.md](ARCHITECTURE.md) — diagrams + state machine + integration table
+- [AGENTS.md](AGENTS.md) — every agent's role + boundary + handoff
+- [ALWAYS_ON.md](ALWAYS_ON.md) — uptime model + watchdog
+- [SELF_HEALING.md](SELF_HEALING.md) — failure-handling philosophy
+- [AGI1_INTEGRATION.md](AGI1_INTEGRATION.md) — how AGI-1 wires in
+- [TODOS.md](TODOS.md) — outstanding work + capability gaps
+
+## Hard rules (non-negotiable)
+
+- No URLs in cold emails 1, 2, or 3 (URL_RE check); links land in the *reply* only
+- Emails 2 and 3 reuse Email 1's subject verbatim (threading_check)
+- No "free", "$1K", "rev share", "14-day sprint", "AI sourcing agent" in any email body (sales_check)
+- Every destructive/credit-spending tool requires explicit operator "yes" in Slack
+- Every uncaught exception posts a `:warning:` to `#cold-email-control` within seconds (`_emit_error`)
+- Every bug we've fixed has a regression test in `tests/test_slack_agent.py`
+
+## Tools the operator (or an LLM agent) can invoke via Slack
+
+`list_active_campaigns`, `list_briefs`, `read_brief`, `stats`, `ingest_csv_from_slack`, `pull_prospector_nl`, `pull_prospector_saved`, `prospect_fetch_confirmed`, `launch_pilot`, `load_leads_from_smartlead`, `preview_emails`, `schedule_campaign`, `generate_preview_pack`, `archive_campaign`, `precreate_campaigns`, `update_voice_rules`, `update_brief`, `log_capability_gap`
+
+## Pre-created Smartlead campaigns
+
+`recruiters-power-partner-{A,B}` · `recruiters-direct-value-{A,B}` · `recruiters-capstone-{A,B}` — all DRAFTED with cached briefs, ready for leads.
+
+## Voice rules (loaded on top of every brief at runtime)
+
+`data/voice_rules.md` — Justin's overrides. Cold email opens a conversation, not a pitch. Money/partner talk lands in the *reply*. Different doors per variant; same offer underneath.
+
+## Run
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e .
+cp .env.example .env  # fill in API keys
+nohup ./ops/watchdog.sh > logs/watchdog.log 2>&1 &
+```
+
+Then talk to the bot in `#cold-email-control` in Slack.

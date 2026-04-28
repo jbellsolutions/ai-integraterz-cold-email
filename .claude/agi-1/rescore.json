@@ -1,0 +1,9 @@
+{
+  "baseline":  {"gstack":  38, "ai_readiness": 10, "self_healing":  4, "total":  52},
+  "rescore":   {"gstack": 100, "ai_readiness": 68, "self_healing": 39, "total": 207},
+  "delta":     {"gstack":  62, "ai_readiness": 58, "self_healing": 35, "total": 155},
+  "regression": false,
+  "iterations_completed": 6,
+  "timestamp": "2026-04-28T18:10:00Z",
+  "note": "Score increased 52 → 207 across 6 iterations. AI-Readiness has remaining gaps in Repo Structure (no init.sh, .cursor/rules) and Advanced (no SPRINT.md) — by-design omissions, not blockers. Self-Healing genome score reaches ceiling once another repo runs /agi-1 against it."
+}

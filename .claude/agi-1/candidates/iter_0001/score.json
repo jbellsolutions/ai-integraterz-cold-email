@@ -1,0 +1,5 @@
+{
+  "before": {"gstack": 38, "ai_readiness": 10, "self_healing": 4, "total": 52},
+  "after":  {"gstack": 60, "ai_readiness": 47, "self_healing": 31, "total": 138},
+  "delta":  {"gstack": 22, "ai_readiness": 37, "self_healing": 27, "total": 86}
+}

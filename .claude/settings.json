@@ -1,0 +1,46 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const fs=require('fs');const p='.claude/MEMORY.md';let mem='';try{mem=fs.readFileSync(p,'utf8')}catch(e){mem='<!-- AGI-1 MEMORY -->\\n'}if(mem.length<1800){const ts=new Date().toISOString().slice(0,10);const note='§ Pre-compaction save '+ts+': context was compressed. Review claude-progress.txt for session state.';mem=mem.trim()+'\\n'+note+'\\n';fs.writeFileSync(p,mem)}\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const input=JSON.parse(process.env.CLAUDE_TOOL_INPUT||'{}');const cmd=input.command||'';if(cmd.includes('git commit')){const{execSync}=require('child_process');try{const staged=execSync('git diff --cached --name-only',{encoding:'utf8'});const issues=[];if(staged.includes('.env')&&!staged.includes('.env.example'))issues.push('WARNING: .env file staged — secrets may be committed');const content=execSync('git diff --cached',{encoding:'utf8'});if(/console\\.log|debugger|binding\\.pry|import pdb/.test(content))issues.push('WARNING: debug statements found in staged changes');if(/(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16})/.test(content))issues.push('CRITICAL: possible API key/secret in staged changes');if(issues.length>0){console.error(issues.join('\\n'));process.exit(2)}}catch(e){}}\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const fs=require('fs');const r=JSON.parse(process.env.CLAUDE_TOOL_RESULT||'{}');if(r.exit_code&&r.exit_code!==0){const p='.claude/learning/observations.json';let obs=[];try{obs=JSON.parse(fs.readFileSync(p,'utf8'))}catch(e){}obs.push({type:'error',tool:'Bash',error_text:(r.output||'').slice(0,500),timestamp:new Date().toISOString(),source:'hook-auto'});fs.writeFileSync(p,JSON.stringify(obs,null,2))}\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/extract-checkpoint.sh 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

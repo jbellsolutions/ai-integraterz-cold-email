@@ -1,0 +1,29 @@
+{
+  "iteration": 1,
+  "source": "council",
+  "round": "round-1-independent",
+  "agents": [
+    {"id": "council-1-claude-code-patterns", "scores_avg": 4.625},
+    {"id": "council-2-architecture-principles", "scores_avg": 3.875},
+    {"id": "council-3-ecosystem-quality", "scores_avg": 5.375}
+  ],
+  "scores": {
+    "feasibility":         {"avg": 6.33, "agents": [7,5,7], "convergence": 7,  "comment": "All three: docs are usable; structural rot would surface in months not days"},
+    "specificity":         {"avg": 3.67, "agents": [3,4,4], "convergence": 9,  "comment": "Tightly converged: no CLAUDE.md, untyped layer boundaries, no contributed skills"},
+    "pattern_adherence":   {"avg": 3.67, "agents": [2,4,5], "convergence": 6,  "comment": "Spread but all <=5: missing .claude/ scaffolding is the through-line"},
+    "innovation":          {"avg": 6.00, "agents": [6,6,6], "convergence": 10, "comment": "Genuinely converged: validator-as-gate + retry-with-feedback is the real novelty"},
+    "risk_awareness":      {"avg": 6.00, "agents": [6,3,9], "convergence": 4,  "comment": "Wide split: docs are honest (council-3) but runtime gates are prompt-side only (council-1) and external boundaries lack retry/idempotency (council-2)"},
+    "integration_realism": {"avg": 4.67, "agents": [5,4,5], "convergence": 9,  "comment": "Hard external couplings undeclared, partial-write recovery missing"},
+    "state_model_coherence":{"avg": 3.33,"agents": [4,2,4], "convergence": 8,  "comment": "Strongest negative consensus: in-memory LEAD_HANDLES + sprawled data dirs + no state.json"},
+    "kpi_measurability":   {"avg": 3.33, "agents": [4,3,3], "convergence": 9,  "comment": "Zero externally-auditable metrics; tool_stats outputs prose"}
+  },
+  "convergence_score_overall": 65,
+  "convergence_verdict": "PROCEED — convergence above 50 threshold",
+  "prioritized_gaps_unanimous": [
+    "missing CLAUDE.md + .claude/ scaffolding (cited by 3/3 agents as #1 or #2 fix)",
+    "in-memory state lost on restart (LEAD_HANDLES, RUNNING_PILOTS) — cited by 3/3",
+    "no machine-readable health/state model — cited by 3/3 agents",
+    "no typed contracts at layer boundaries; pydantic dep unused — cited by 2/3"
+  ],
+  "highest_priority_synthesis_fix": "Bootstrap AGI-1 (.claude/ scaffold + agents/main-agent.md + .agent/) AND commit a SQLite (or JSON) durable state store keyed by lead_id × campaign_id × stage. The first satisfies pattern_adherence + specificity + ecosystem KPIs in one motion; the second satisfies state_model_coherence + risk_awareness + crash recovery. These are both Phase 4 tasks."
+}

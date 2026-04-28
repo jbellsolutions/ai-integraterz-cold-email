@@ -1,0 +1,18 @@
+{
+  "repo": "{{PROJECT_NAME}}",
+  "created": "{{DATE}}",
+  "insights": [],
+  "_schema": {
+    "insight": {
+      "id": "INS-0001",
+      "timestamp": "2026-03-28T15:00:00Z",
+      "type": "rewrite_instruction|archive_skill|optimize_skill|add_context|add_warning|promote_pattern|demote_pattern",
+      "observation_ids": ["OBS-0001", "OBS-0003", "OBS-0007"],
+      "hypothesis": "CLAUDE.md line 42 says 'use pytest' but the repo uses unittest. Agents ignore it.",
+      "action": "Rewrite CLAUDE.md line 42 to say 'use unittest (this repo does not use pytest)'",
+      "confidence": 0.85,
+      "applied": false,
+      "result": null
+    }
+  }
+}

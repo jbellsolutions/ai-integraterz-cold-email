@@ -1,0 +1,32 @@
+# Pre-commit hooks for cold-email-2.0.
+# Install: pip install pre-commit && pre-commit install
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-json
+      - id: check-toml
+
+  # Block committing .env files even if accidentally staged
+  - repo: local
+    hooks:
+      - id: no-env-commit
+        name: Block .env from ever being committed
+        entry: bash -c 'if git diff --cached --name-only | grep -E "(^|/)\.env$"; then echo "ERROR: .env file staged. Aborting commit."; exit 1; fi'
+        language: system
+        always_run: true
+        pass_filenames: false
+
+      - id: regression-tests
+        name: Run regression tests on slack-agent / copy-squad changes
+        entry: bash -c 'if git diff --cached --name-only | grep -qE "(orchestrator/slack_agent|squads/copy/squad|tools/slack_notify)\.py"; then .venv/bin/python tests/test_slack_agent.py; fi'
+        language: system
+        pass_filenames: false

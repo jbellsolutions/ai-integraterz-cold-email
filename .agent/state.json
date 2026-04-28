@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0.0",
+  "session_count": 0,
+  "last_session": null,
+  "last_genome_sync": null,
+  "last_learn_cycle": null,
+  "last_heal_check": null,
+  "conversation_summary": "",
+  "pending_tasks": [],
+  "notes": []
+}

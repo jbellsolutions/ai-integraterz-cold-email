@@ -1,0 +1,81 @@
+{
+  "schema_version": "1.0.0",
+  "description": "PII patterns scanned before any memory/observation/checkpoint write. If matched, the write is blocked and logged.",
+  "patterns": [
+    {
+      "id": "PII-001",
+      "name": "Social Security Number",
+      "pattern": "\\d{3}-\\d{2}-\\d{4}",
+      "action": "block",
+      "severity": "critical"
+    },
+    {
+      "id": "PII-002",
+      "name": "Credit Card Number",
+      "pattern": "\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}",
+      "action": "block",
+      "severity": "critical"
+    },
+    {
+      "id": "PII-003",
+      "name": "OpenAI API Key",
+      "pattern": "sk-[a-zA-Z0-9]{20,}",
+      "action": "block",
+      "severity": "critical"
+    },
+    {
+      "id": "PII-004",
+      "name": "Google API Key",
+      "pattern": "AIza[a-zA-Z0-9_-]{35}",
+      "action": "block",
+      "severity": "critical"
+    },
+    {
+      "id": "PII-005",
+      "name": "GitHub Personal Access Token",
+      "pattern": "ghp_[a-zA-Z0-9]{36}",
+      "action": "block",
+      "severity": "critical"
+    },
+    {
+      "id": "PII-006",
+      "name": "AWS Access Key",
+      "pattern": "AKIA[A-Z0-9]{16}",
+      "action": "block",
+      "severity": "critical"
+    },
+    {
+      "id": "PII-007",
+      "name": "Password in Plain Text",
+      "pattern": "password\\s*[:=]\\s*\\S+",
+      "action": "block",
+      "severity": "high"
+    },
+    {
+      "id": "PII-008",
+      "name": "Anthropic API Key",
+      "pattern": "sk-ant-[a-zA-Z0-9-]{20,}",
+      "action": "block",
+      "severity": "critical"
+    },
+    {
+      "id": "PII-009",
+      "name": "Stripe API Key",
+      "pattern": "sk_live_[a-zA-Z0-9]{20,}",
+      "action": "block",
+      "severity": "critical"
+    },
+    {
+      "id": "PII-010",
+      "name": "Generic Long Secret",
+      "pattern": "[A-Za-z0-9+/]{40,}={0,2}",
+      "action": "warn",
+      "severity": "medium",
+      "note": "May be false positive — warn but don't block"
+    }
+  ],
+  "on_block": {
+    "action": "Log to .claude/learning/pii-blocked.json with timestamp, pattern matched, and source. Print warning to user: 'Blocked: detected [pattern name] in memory write. Sensitive data was NOT stored.'",
+    "never": "Never store the actual matched value in the log — only the pattern ID and source file."
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "iteration": "iter_0006",
+  "source": "autoresearch_research",
+  "iron_law_satisfied": "Every insight cites specific trace evidence (file_commit + observation IDs)",
+  "insights": [
+    {
+      "id": "ins-null-pattern",
+      "title": "LLM JSON output null-default pattern",
+      "trace_evidence": ["obs-004", "obs-005", "obs-006 (partial)"],
+      "claim": "When LLM emits {key: null}, dict.get(key, default) returns None NOT the default. Two crashes already; pattern likely recurs anywhere we consume LLM JSON.",
+      "applied_in": "squads/copy/squad.py — _safe_list + _pick_candidate helpers (commit 09e34a7)",
+      "next_steps": "Audit ALL .get(_, []) and .get(_, {}) sites in squads/* and orchestrator/*. Likely candidates: squads/reply/squad.py, tools/prospect_filters.py.",
+      "confidence": 0.95,
+      "test": "test_copy_squad_handles_null_pick_in_hook + test_copy_squad_handles_null_sequence_in_body_output"
+    },
+    {
+      "id": "ins-retry-must-feedback",
+      "title": "Retries without violation-feedback replay identical output",
+      "trace_evidence": ["obs-006"],
+      "claim": "v4 of preview_pack retried 2x but produced same 'free recruiter stack' subject — same prompt, same output. v5 injects violations into retry prompt; immediate quality jump.",
+      "applied_in": "squads/copy/squad.py — _draft_hook + _draft_body now accept previous_violations; hook re-rolled when implicated (commit 626b8c6)",
+      "next_steps": "Apply same pattern to Reply Squad's drafter retry loop.",
+      "confidence": 0.9,
+      "test": "(none — observed in production preview pack runs)"
+    },
+    {
+      "id": "ins-validators-need-bare-word-regex",
+      "title": "Phrase-list bans miss bare-word violations",
+      "trace_evidence": ["obs-006"],
+      "claim": "SALES_PATTERNS = ['for free', 'completely free'] doesn't catch 'free recruiter stack'. Added \\bfree\\b regex; pattern: when banning a concept, ban both the canonical phrases AND the standalone keyword.",
+      "applied_in": "squads/copy/squad.py — FREE_WORD_RE regex check in sales_check (commit 626b8c6)",
+      "next_steps": "Audit other validator lists: SLOP_PHRASES might miss bare-word forms of 'leverage', 'synergy', etc.",
+      "confidence": 0.85
+    },
+    {
+      "id": "ins-supervision-not-llm-tech",
+      "title": "Always-on is plumbing, not LLM capability",
+      "trace_evidence": ["obs-008"],
+      "claim": "Daemon was dead for hours unnoticed. AGI/forge/Hermes/reinforcement all irrelevant — needed: process supervisor + heartbeat + visible failures. ops/watchdog.sh closes this.",
+      "applied_in": "ops/watchdog.sh, ops/com.aiintegraterz.cold-email.*.plist, heartbeat_loop in slack_agent.py (commit ba71a71)",
+      "next_steps": "Move repo out of ~/Desktop or grant Full Disk Access to /bin/bash to enable launchd (currently TCC-blocked).",
+      "confidence": 1.0
+    },
+    {
+      "id": "ins-check-installed-before-dismissing",
+      "title": "Look at ~/.claude/skills/ before claiming a capability doesn't exist",
+      "trace_evidence": ["obs-009"],
+      "claim": "I dismissed AGI-1 as marketing. It's a real 17-skill framework Justin had installed globally. Lesson: when the user claims a capability is part of the stack, verify by listing ~/.claude/skills/ before writing 'X isn't real'.",
+      "applied_in": "ALWAYS_ON.md correction + AGI1_INTEGRATION.md (commit dd0f458)",
+      "next_steps": "Codify into CLAUDE.md / ETHOS.md as a rule for future sessions.",
+      "confidence": 1.0
+    }
+  ],
+  "candidates_for_genome_promotion": [
+    "_safe_list + _pick_candidate helpers (LLM JSON null-default pattern) — confidence 0.95, applied in 1 repo",
+    "validator-with-violation-feedback retry loop — confidence 0.9, applied in 1 repo",
+    "watchdog.sh bash supervisor for macOS Desktop-resident repos (TCC-aware) — confidence 1.0, applied in 1 repo"
+  ]
+}

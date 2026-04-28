@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0.0",
+  "repo": "{{PROJECT_NAME}}",
+  "created": "{{DATE}}",
+  "total_heals": 0,
+  "successful_heals": 0,
+  "failed_heals": 0,
+  "patterns_learned": 0,
+  "entries": []
+}

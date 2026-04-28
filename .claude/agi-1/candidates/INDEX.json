@@ -1,0 +1,58 @@
+{
+  "iterations": [
+    {
+      "id": "iter_0001",
+      "timestamp": "2026-04-28T17:55:00Z",
+      "source": "autoresearch",
+      "gstack_delta": 22,
+      "ai_delta": 37,
+      "hl_delta": 27,
+      "reverted": false
+    },
+    {
+      "id": "iter_0002",
+      "timestamp": "2026-04-28T17:58:00Z",
+      "source": "autoresearch",
+      "gstack_delta": 10,
+      "ai_delta": 5,
+      "hl_delta": 0,
+      "reverted": false
+    },
+    {
+      "id": "iter_0003",
+      "timestamp": "2026-04-28T18:00:00Z",
+      "source": "autoresearch",
+      "gstack_delta": 0,
+      "ai_delta": 12,
+      "hl_delta": 0,
+      "reverted": false
+    },
+    {
+      "id": "iter_0004",
+      "timestamp": "2026-04-28T18:02:00Z",
+      "source": "autoresearch",
+      "gstack_delta": 25,
+      "ai_delta": 4,
+      "hl_delta": 0,
+      "reverted": false
+    },
+    {
+      "id": "iter_0005",
+      "timestamp": "2026-04-28T18:05:00Z",
+      "source": "autoresearch",
+      "gstack_delta": 5,
+      "ai_delta": 0,
+      "hl_delta": 0,
+      "reverted": false
+    },
+    {
+      "id": "iter_0006",
+      "timestamp": "2026-04-28T18:08:00Z",
+      "source": "research",
+      "gstack_delta": 0,
+      "ai_delta": 0,
+      "hl_delta": 5,
+      "reverted": false
+    }
+  ]
+}
