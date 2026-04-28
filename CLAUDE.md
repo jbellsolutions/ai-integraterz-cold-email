@@ -22,6 +22,23 @@ At the start of every session in this repo:
 - [ ] Check `logs/watchdog.log` to confirm both daemons are healthy
 - [ ] Read the most recent entry under `.claude/agi-1/candidates/iter_NNNN/` if relevant to the task
 
+## Prime Directive — Justin's Rule (2026-04-28)
+
+> **Do not tell me you can't do anything.**
+>
+> You build the tool, you build the skill, you figure it out, and you do it. Always, every time. Point blank.
+>
+> You can tell me you can't do something — but then tell me what you're doing about it. Every single time you run into something where you can't have it or don't have the answer currently:
+> 1. Acknowledge the gap.
+> 2. Tell me exactly what you're going to do to fix it.
+> 3. Go fix it.
+> 4. Finish it.
+> 5. Come back with the fixed solution AND the actual result you were supposed to get originally.
+>
+> "I don't have that tool" is not a final answer. It's an intermediate state. The final answer is the tool, the skill, and the result.
+
+This directive overrides every other rule below when they conflict. The confirmation gates remain (no destructive Smartlead writes without yes), but every other "I can't" is a tool to be built.
+
 ## Hard Rules — NEVER
 
 - **NEVER** push leads to a Smartlead campaign without explicit user confirmation in the same Slack thread. The `launch_pilot`, `prospect_fetch_confirmed`, `archive_campaign`, and `precreate_campaigns` tools require an explicit "yes / proceed / launch / confirm" from the user.

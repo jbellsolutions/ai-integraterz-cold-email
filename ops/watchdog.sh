@@ -36,14 +36,21 @@ mkdir -p "$REPO_DIR/logs"
 
 PYTHON="$REPO_DIR/.venv/bin/python"
 
-# Two daemons. Per-daemon state stored in parallel arrays (bash 3.2 friendly).
-NAMES=(slack_agent reply_loop)
+# Three daemons. Per-daemon state stored in parallel arrays (bash 3.2 friendly).
+# - slack_agent: the concierge (handles inbound Slack, routes to ledger)
+# - supervisor:  watches the durable task ledger, spawns workers,
+#                escalates stalls, posts completions
+# - reply_loop:  reply-approval daemon (Smartlead inbox → #cold-email-replies)
+NAMES=(slack_agent supervisor reply_loop)
 ARGS_slack_agent="-u -m orchestrator.slack_agent --no-announce"
+ARGS_supervisor="-u -m orchestrator.supervisor --interval=15"
 ARGS_reply_loop="-u -m orchestrator.reply_loop --interval=60 --angle=power-partner"
 
 PID_slack_agent=0
+PID_supervisor=0
 PID_reply_loop=0
 LAST_RESTART_slack_agent=0
+LAST_RESTART_supervisor=0
 LAST_RESTART_reply_loop=0
 
 start_daemon() {

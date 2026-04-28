@@ -383,16 +383,163 @@ def tool_load_leads_from_smartlead(args: dict) -> dict:
             "summary": lead_summary(leads)}
 
 
+def _serialize_handle_to_disk(handle: str) -> bool:
+    """Persist a LEAD_HANDLES entry to data/slack/handles/<handle>.json so a
+    worker subprocess (different process, different memory) can load it.
+    Returns True if written, False if handle is unknown."""
+    if handle not in LEAD_HANDLES:
+        return False
+    meta = LEAD_HANDLES[handle]
+    d = REPO_ROOT / "data" / "slack" / "handles"
+    d.mkdir(parents=True, exist_ok=True)
+    leads_serialized = []
+    for lead in meta.get("leads", []):
+        if hasattr(lead, "__dict__"):
+            leads_serialized.append(dict(lead.__dict__))
+        elif isinstance(lead, dict):
+            leads_serialized.append(dict(lead))
+        else:
+            leads_serialized.append({"raw": str(lead)})
+    payload = {
+        "handle": handle,
+        "source": meta.get("source", ""),
+        "created_at": meta.get("created_at", ""),
+        "leads": leads_serialized,
+    }
+    (d / f"{handle}.json").write_text(json.dumps(payload, indent=2,
+                                                       default=str))
+    return True
+
+
+def _route_to_ledger(intent: str, tool_name: str, args: dict,
+                       *, deadline_seconds: int = 1800,
+                       channel: str | None = None,
+                       thread_ts: str | None = None) -> dict:
+    """Common path for long-running tools. Creates a ledger task; supervisor
+    spawns a worker. Returns immediately to the concierge with the task id.
+
+    Side effects: if `args` carries a `lead_handle`, the in-memory handle is
+    serialized to disk so the worker process can load it.
+    """
+    from tools.task_ledger import get_ledger
+    args_clean = {k: v for k, v in args.items() if not k.startswith("_")}
+    if "lead_handle" in args_clean:
+        ok = _serialize_handle_to_disk(args_clean["lead_handle"])
+        if not ok:
+            return {"error": f"unknown lead_handle "
+                                f"{args_clean['lead_handle']!r}"}
+    ledger = get_ledger()
+    task_id = ledger.create_task(
+        intent=intent,
+        channel=channel,
+        thread_ts=thread_ts,
+        created_by="slack",
+        tool_call={"name": tool_name, "args": args_clean},
+        deadline_seconds=deadline_seconds,
+    )
+    return {
+        "queued": True,
+        "task_id": task_id,
+        "tool": tool_name,
+        "deadline_seconds": deadline_seconds,
+        "note": (f"Task `{task_id}` queued. The supervisor will spawn a "
+                   "worker within 15s. Progress posts to this thread; final "
+                   "result delivered as a Slack file or message when done. "
+                   "If you want to know status, ask `list my tasks`."),
+    }
+
+
+def tool_list_my_tasks(args: dict) -> dict:
+    """Return all tasks in the current Slack thread (or any thread the user
+    names). Read-only. No confirmation needed."""
+    from tools.task_ledger import get_ledger
+    ledger = get_ledger()
+    thread_ts = args.get("thread_ts") or args.get("_thread_ts")
+    if not thread_ts:
+        return {"error": "no thread_ts in scope"}
+    tasks = ledger.list_by_thread(thread_ts)
+    summary = []
+    for t in tasks[:30]:
+        summary.append({
+            "id": t["id"],
+            "intent": (t.get("intent") or "")[:120],
+            "status": t["status"],
+            "stage": t.get("stage"),
+            "progress": t.get("progress"),
+            "attempts": t.get("attempts"),
+            "depth": t.get("depth"),
+            "parent": t.get("parent_task"),
+            "created_at": t.get("created_at"),
+            "completed_at": t.get("completed_at"),
+        })
+    return {"thread_ts": thread_ts, "count": len(tasks), "tasks": summary}
+
+
+def tool_cancel_task(args: dict) -> dict:
+    """Mark a task as cancelled. The worker checks the ledger on its next
+    progress callback and exits cleanly. Subagent descendants are also
+    cancelled."""
+    from tools.task_ledger import get_ledger
+    ledger = get_ledger()
+    task_id = args["task_id"]
+    t = ledger.get(task_id)
+    if not t:
+        return {"error": f"unknown task_id {task_id!r}"}
+    if t["status"] in ("completed", "permanently_failed", "cancelled"):
+        return {"task_id": task_id, "already": t["status"]}
+    descendants = ledger.descendants(task_id)
+    ledger.mark_cancelled(task_id)
+    for d in descendants:
+        ledger.mark_cancelled(d["id"])
+    return {"task_id": task_id, "cancelled": True,
+            "descendants_cancelled": len(descendants)}
+
+
+def tool_spawn_subagent(args: dict) -> dict:
+    """Concierge-side entry point for spawn_subagent. Creates a ROOT task
+    whose tool_call is `spawn_subagent` itself. The worker that picks it up
+    will fan out via orchestrator.spawner.spawn_and_wait."""
+    intent = args.get("intent",
+                         f"spawn {args.get('role', 'subagent')}")
+    channel = args.get("_channel") or os.environ.get(
+        "SLACK_CONTROL_CHANNEL", "#cold-email-control")
+    return _route_to_ledger(
+        intent=intent,
+        tool_name="spawn_subagent",
+        args=args,
+        deadline_seconds=int(args.get("timeout_seconds", 1800)),
+        channel=channel,
+        thread_ts=args.get("_thread_ts"),
+    )
+
+
+def tool_council_review(args: dict) -> dict:
+    """Concierge-side entry: queue a council review as a top-level task.
+    Worker spawns one critic per criterion in parallel and returns the
+    aggregated verdict. Useful before delivering CSVs to ensure quality."""
+    intent = (f"council review of {args.get('target', '?')[:60]} "
+                f"on {len(args.get('criteria', []))} criteria")
+    channel = args.get("_channel") or os.environ.get(
+        "SLACK_CONTROL_CHANNEL", "#cold-email-control")
+    return _route_to_ledger(
+        intent=intent,
+        tool_name="council_review",
+        args=args,
+        deadline_seconds=600,
+        channel=channel,
+        thread_ts=args.get("_thread_ts"),
+    )
+
+
 def tool_personalize_to_csv(args: dict) -> dict:
     """Run Strategy → Research → Copy on a lead handle and post a CSV to Slack
     with personalized email_1/2/3 subject + body per prospect. NO Smartlead
     writes — Justin imports the CSV himself.
 
-    This is the simplest, most-reliable path: leads in, CSV out. It removes the
-    entire Smartlead-write half of the pipeline (and that half's failure modes:
-    auth issues, idempotent-lookup races, custom-field mapping mismatches,
-    silent template-token uploads). Same Strategy + Research + Copy stages as
-    launch_pilot, with the same hard-fail-on-empty guard.
+    Routes through the durable task ledger: the supervisor spawns a worker
+    subprocess that does the work, posts progress to this thread, and uploads
+    the CSV when done. Survives concierge restart, supervisor restart, and
+    transient worker crashes (with one automatic retry on stall).
 
     args:
       lead_handle: handle from ingest_csv_from_slack / load_leads_from_smartlead /
@@ -406,7 +553,36 @@ def tool_personalize_to_csv(args: dict) -> dict:
       email_1_subject, email_1_body, email_2_subject, email_2_body,
       email_3_subject, email_3_body, slop_pass, signal_tier
     """
-    from orchestrator.main import REPO_ROOT as RR  # avoid stale import on reload
+    from squads.smartlead.squad import make_campaign_name
+    handle = args["lead_handle"]
+    niche = args.get("niche")
+    offer = args["offer"]
+    variant = args.get("variant", "A")
+    if handle not in LEAD_HANDLES:
+        return {"error": f"unknown lead_handle '{handle}' — call ingest or fetch first"}
+    leads_count = len(LEAD_HANDLES[handle].get("leads", []))
+    campaign_name = make_campaign_name(niche, offer, variant)
+    intent = (f"personalize {leads_count} leads → CSV against "
+                f"{campaign_name} brief")
+    channel = os.environ.get("SLACK_CONTROL_CHANNEL", "#cold-email-control")
+    return _route_to_ledger(
+        intent=intent,
+        tool_name="personalize_to_csv",
+        args=args,
+        # Allow ~1 hr per 1k leads, min 30min, max 4hr
+        deadline_seconds=max(1800, min(14400, 60 * leads_count // 17)),
+        channel=channel,
+        thread_ts=args.get("_thread_ts"),
+    )
+
+
+# Original in-process implementation kept under a new name for legacy callers
+# (e.g. v1 callers from before the ledger). Workers do not call this — they
+# use orchestrator.worker._run_personalize_direct which has the same logic
+# but takes leads-from-disk via the serialized handle.
+def _legacy_tool_personalize_to_csv_inprocess(args: dict) -> dict:
+    """LEGACY: kept for any caller that needs the old in-process behavior.
+    Use `tool_personalize_to_csv` (ledger-routed) for all new calls."""
     from squads.copy import CopySquad
     from squads.research import ResearchSquad
     from squads.strategy import StrategySquad
@@ -1031,6 +1207,40 @@ TOOLS = [
                            "campaign_name": {"type": "string"},
                            "append": {"type": "string"},
                            "replace": {"type": "string"}}}},
+    {"name": "list_my_tasks",
+     "description": "Read-only. Returns all tasks (in-flight and completed) recorded in this Slack thread. Call before answering 'what are you working on?' / 'is X done yet?' / 'status?' — NEVER guess from memory; always read the ledger. Returns id, intent, status, stage, progress, attempts, depth, parent.",
+     "input_schema": {"type": "object", "properties": {
+                           "thread_ts": {"type": "string",
+                              "description": "if absent, uses current thread"}}}},
+    {"name": "cancel_task",
+     "description": "Cancel an in-flight task by id. Marks the task and all its descendant subagents as cancelled in the ledger; the workers detect this on their next progress callback and exit cleanly. Idempotent.",
+     "input_schema": {"type": "object", "required": ["task_id"],
+                       "properties": {"task_id": {"type": "string"}}}},
+    {"name": "spawn_subagent",
+     "description": "Delegate work to a subagent (a child task that runs in its own subprocess with its own LLM context, scoped tool subset, and own ledger entry). Use for: (1) parallel fan-out — e.g. personalize the same leads against 6 different briefs in parallel; (2) different model tier — Haiku for cheap batch validation, Opus for synthesis; (3) recursive decomposition — subagent itself can spawn subagents up to max_depth=3. Children report results up to the parent via the ledger. Only the concierge (this agent) talks to Slack; subagents return data, not messages. Returns immediately with a task_id; check status with list_my_tasks.",
+     "input_schema": {"type": "object",
+                       "required": ["intent", "tool_call"],
+                       "properties": {
+                           "role": {"type": "string",
+                              "description": "short role label, e.g. 'personalizer-A', 'voice-critic'"},
+                           "intent": {"type": "string"},
+                           "tool_call": {"type": "object",
+                              "description": "{name, args} — the deterministic tool the subagent runs"},
+                           "children": {"type": "array",
+                              "description": "OPTIONAL batch fan-out: list of {role, intent, tool_call} — runs all in parallel, returns when all settle",
+                              "items": {"type": "object"}},
+                           "max_depth": {"type": "integer", "default": 3},
+                           "timeout_seconds": {"type": "integer", "default": 1800}}}},
+    {"name": "council_review",
+     "description": "Spawn N parallel critic subagents (one per criterion), each reads the target and returns a pass/fail verdict + reasoning. Use BEFORE delivering high-stakes outputs to ensure quality (e.g. before posting a CSV: voice-critic, threading-critic, deliverability-critic). Returns aggregate {pass, blocking_count, verdicts}. If any critic blocks, surface the verdict to Justin instead of delivering.",
+     "input_schema": {"type": "object",
+                       "required": ["criteria", "target"],
+                       "properties": {
+                           "criteria": {"type": "array", "items": {"type": "string"},
+                              "description": "list of single-criterion descriptions, e.g. ['voice rules compliance', 'no urls in email 1', 'thread subjects match']"},
+                           "target": {"type": "string",
+                              "description": "either a file path (e.g. data/exports/foo.csv) or inline content to evaluate"},
+                           "max_depth": {"type": "integer", "default": 3}}}},
     {"name": "log_capability_gap",
      "description": "Call this BEFORE telling the user 'I can't do that'. Logs a row to data/skill_gaps.jsonl so recurring gaps surface as the next tools to build. After calling, give the user a clean answer about what you can do as an alternative.",
      "input_schema": {"type": "object", "required": ["user_request", "missing_tool_name"],
@@ -1065,6 +1275,10 @@ TOOL_FUNCS = {
     "prospect_fetch_confirmed": tool_prospect_fetch_confirmed,
     "launch_pilot": tool_launch_pilot,
     "personalize_to_csv": tool_personalize_to_csv,
+    "list_my_tasks": tool_list_my_tasks,
+    "cancel_task": tool_cancel_task,
+    "spawn_subagent": tool_spawn_subagent,
+    "council_review": tool_council_review,
     "load_leads_from_smartlead": tool_load_leads_from_smartlead,
     "preview_emails": tool_preview_emails,
     "generate_preview_pack": tool_generate_preview_pack,
@@ -1085,10 +1299,21 @@ TOOL_FUNCS = {
 # longer claim ignorance of state that's right in front of it.
 # ---------------------------------------------------------------------------
 
-def _build_state_snapshot() -> str:
-    """Returns a compact markdown snapshot of operator state. Kept under ~3KB.
+def _build_state_snapshot(thread_ts: str | None = None) -> str:
+    """Returns a compact markdown snapshot of operator state. Kept under ~6KB.
     Errors are swallowed — better to send a partial snapshot than to fail the
-    whole turn."""
+    whole turn.
+
+    Includes (in order):
+      1. Live Smartlead campaigns (recruiter cells + TenXVA source campaigns)
+      2. Cached briefs
+      3. voice_rules.md tail
+      4. Active LEAD_HANDLES (in-memory)
+      5. Recent pilot runs
+      6. Recent CSV exports
+      7. Active tasks for this Slack thread (from durable ledger)
+      8. Last 24h of concierge journal entries
+    """
     parts: list[str] = ["# CURRENT STATE — read this before answering",
                           "_(Auto-injected; do NOT ask Justin questions whose "
                           "answers are below.)_\n"]
@@ -1186,7 +1411,98 @@ def _build_state_snapshot() -> str:
     except Exception:
         pass
 
+    # Active tasks for this thread (durable ledger — survives restarts)
+    if thread_ts:
+        try:
+            from tools.task_ledger import get_ledger
+            tasks = get_ledger().list_by_thread(thread_ts)[:8]
+            if tasks:
+                lines = ["## Active tasks in this thread (durable ledger)"]
+                for t in tasks:
+                    progress = (f"{int((t.get('progress') or 0) * 100)}%"
+                                  if t.get("progress") is not None else "?")
+                    lines.append(f"- `{t['id']}` · {t['status']:9} · "
+                                    f"stage `{t.get('stage') or '-'}` · "
+                                    f"{progress} · "
+                                    f"depth {t.get('depth', 0)} · "
+                                    f"{(t.get('intent') or '')[:80]}")
+                parts.append("\n".join(lines))
+        except Exception:
+            pass
+
+    # Concierge journal tail (last 24h decisions)
+    try:
+        jpath = REPO_ROOT / "data" / "concierge" / "journal.jsonl"
+        if jpath.exists():
+            cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(hours=24)
+            recent = []
+            for line in jpath.read_text().strip().splitlines()[-50:]:
+                try:
+                    e = json.loads(line)
+                    ets = dt.datetime.fromisoformat(
+                        e["ts"].rstrip("Z"))
+                    if ets.replace(tzinfo=dt.UTC) >= cutoff:
+                        recent.append(e)
+                except Exception:
+                    continue
+            if recent:
+                lines = ["## Concierge journal (last 24h, last 8 entries)"]
+                for e in recent[-8:]:
+                    lines.append(f"- `{e.get('ts','?')[:19]}` "
+                                    f"{e.get('event','?')} · "
+                                    f"{(e.get('detail') or '')[:120]}")
+                parts.append("\n".join(lines))
+    except Exception:
+        pass
+
     return "\n\n".join(parts)
+
+
+def _load_concierge_identity() -> str:
+    """Load data/concierge/identity.md verbatim. This is the SOUL of the
+    concierge — prepended to SYSTEM_PROMPT on every turn."""
+    p = REPO_ROOT / "data" / "concierge" / "identity.md"
+    if p.exists():
+        return p.read_text()
+    return ""
+
+
+def _load_relevant_playbooks(user_message: str = "") -> str:
+    """Naive keyword match over data/concierge/playbooks/*.md. Picks at most
+    one playbook to inject (the one whose filename matches keywords in the
+    user's message), keeps under 4KB."""
+    p = REPO_ROOT / "data" / "concierge" / "playbooks"
+    if not p.exists():
+        return ""
+    msg_lower = (user_message or "").lower()
+    candidates = list(p.glob("*.md"))
+    if not candidates:
+        return ""
+    # Score: count of (filename word ∩ message words)
+    def score(path):
+        words = path.stem.replace("-", " ").split()
+        return sum(1 for w in words if w in msg_lower)
+    best = max(candidates, key=score)
+    if score(best) == 0:
+        return ""  # no playbook clearly applies
+    body = best.read_text()
+    if len(body) > 4000:
+        body = body[:4000] + "\n\n[... truncated ...]"
+    return f"## Active playbook: {best.name}\n\n{body}"
+
+
+def _journal_decision(event: str, detail: dict | None = None) -> None:
+    """Append a decision to data/concierge/journal.jsonl. Best-effort."""
+    try:
+        p = REPO_ROOT / "data" / "concierge" / "journal.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"ts": dt.datetime.now(dt.UTC).isoformat(),
+                  "event": event,
+                  "detail": detail or {}}
+        with p.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1330,9 +1646,33 @@ async def run_tools(client: anthropic.Anthropic, conversation: list[dict],
     handles, and exports. This is what kills the "agent asks dumb questions"
     pattern — it can't claim ignorance of state that's right in front of it.
     """
+    # Latest user message text (for playbook keyword matching)
+    last_user_text = ""
+    for m in reversed(conversation):
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                last_user_text = c
+                break
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        last_user_text = b.get("text", "")
+                        break
+                if last_user_text:
+                    break
+
+    identity = _load_concierge_identity()
+    playbook = _load_relevant_playbooks(last_user_text)
+
     while True:
-        snapshot = _build_state_snapshot()
-        system_full = SYSTEM_PROMPT + "\n\n---\n\n" + snapshot
+        snapshot = _build_state_snapshot(thread_ts=thread_ts)
+        # Order: identity (SOUL) → operational rules → playbook (if any) → live state
+        system_parts = [identity, SYSTEM_PROMPT]
+        if playbook:
+            system_parts.append(playbook)
+        system_parts.append(snapshot)
+        system_full = "\n\n---\n\n".join(p for p in system_parts if p)
         msg = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=2048,
@@ -1424,6 +1764,13 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
     # Register this thread as active so the poll loop also watches for reply
     # messages here (conversations.history doesn't return thread replies).
     _register_active_thread(thread_ts, ts)
+
+    # Journal: every inbound message is a decision point
+    _journal_decision("user_message", {
+        "user": user, "thread_ts": thread_ts,
+        "text_preview": (text or "")[:200],
+        "files": len(files),
+    })
 
     # Visual heartbeat: reaction on the user's message changes as we progress.
     # eyes → working, white_check_mark → done, x → error. All best-effort
