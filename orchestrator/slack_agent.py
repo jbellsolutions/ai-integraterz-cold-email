@@ -915,11 +915,28 @@ def tool_update_campaign_schedule(args: dict) -> dict:
     if args.get("schedule_start_iso"):
         schedule["schedule_start_time"] = args["schedule_start_iso"]
     else:
-        # default: tomorrow at start_hour ET → UTC
-        # 08:00 ET in DST = 12:00 UTC. Approx; user can override.
-        tomorrow = (dt.datetime.now(dt.UTC) + dt.timedelta(days=1)).date()
+        # Codex P2 fix 2026-04-28: derive the UTC start from the supplied
+        # timezone + start_hour instead of hardcoding T12:00Z (which only
+        # matches 8am New York during DST and is wrong for every other
+        # case). zoneinfo handles DST + non-US timezones correctly.
+        from zoneinfo import ZoneInfo
+        try:
+            tz = ZoneInfo(schedule["timezone"])
+        except Exception:
+            tz = ZoneInfo("America/New_York")
+        try:
+            sh, sm = (str(schedule["start_hour"]) + ":00").split(":")[:2]
+            sh, sm = int(sh), int(sm)
+        except Exception:
+            sh, sm = 8, 0
+        tomorrow_local = dt.datetime.now(tz).date() + dt.timedelta(days=1)
+        local_start = dt.datetime.combine(
+            tomorrow_local, dt.time(sh, sm), tzinfo=tz
+        )
         schedule["schedule_start_time"] = (
-            f"{tomorrow.isoformat()}T12:00:00.000Z"
+            local_start.astimezone(dt.UTC)
+            .isoformat()
+            .replace("+00:00", ".000Z")
         )
 
     cli = SmartleadCLI()
@@ -1545,9 +1562,20 @@ def _build_state_snapshot(thread_ts: str | None = None) -> str:
             if recent:
                 lines = ["## Concierge journal (last 24h, last 8 entries)"]
                 for e in recent[-8:]:
+                    # Codex P2 fix 2026-04-28: detail is a dict, but the
+                    # previous code did `(detail or '')[:120]` which raises
+                    # TypeError on dict slicing. The outer try-except
+                    # swallowed it silently and the WHOLE journal section
+                    # never appeared in the snapshot. Serialize first.
+                    detail = e.get("detail")
+                    if detail and not isinstance(detail, str):
+                        try:
+                            detail = json.dumps(detail, default=str)
+                        except Exception:
+                            detail = str(detail)
+                    detail = (detail or "")[:120]
                     lines.append(f"- `{e.get('ts','?')[:19]}` "
-                                    f"{e.get('event','?')} · "
-                                    f"{(e.get('detail') or '')[:120]}")
+                                    f"{e.get('event','?')} · {detail}")
                 parts.append("\n".join(lines))
     except Exception:
         pass
@@ -1714,6 +1742,8 @@ NEVER call any of these without an explicit user "yes" / "go" / "confirm" / "do 
 - `schedule_campaign`         (starts real outbound email sending)
 - `archive_campaign`          (destructive)
 - `precreate_campaigns`       (writes to Smartlead, costs LLM tokens)
+- `import_csv_to_smartlead`   (writes leads + custom_fields to live Smartlead campaign)
+- `update_campaign_schedule`  (rewrites sending schedule on a live Smartlead campaign)
 
 `schedule_campaign` has an EXTRA gate: never call it without first having shown the user `preview_emails` output for that campaign in the same thread. The user must see real copy and explicitly approve before the campaign goes ACTIVE.
 
@@ -1848,7 +1878,11 @@ def _emit_error(slack: SlackClient, channel: str, thread_ts: str | None,
 
 
 async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
-                          channel: str, msg: dict) -> None:
+                          channel: str, msg: dict) -> bool:
+    """Returns True if the turn ran end-to-end (LLM responded, state saved).
+    Returns False on any failure so the caller can decide whether to advance
+    the channel/thread cursor (don't advance on failure → next poll retries).
+    """
     text = msg.get("text", "")
     files = msg.get("files", [])
     user = msg.get("user", "?")
@@ -1857,10 +1891,6 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
     thread_ts = msg.get("thread_ts") or ts
     print(f"[slack_agent] msg from {user} ts={ts} thread={thread_ts} files={len(files)} "
            f"text={text[:120]!r}", flush=True)
-
-    # Register this thread as active so the poll loop also watches for reply
-    # messages here (conversations.history doesn't return thread replies).
-    _register_active_thread(thread_ts, ts)
 
     # Journal: every inbound message is a decision point
     _journal_decision("user_message", {
@@ -1874,6 +1904,7 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
     # (won't break the main flow if reactions:write scope is missing).
     slack.add_reaction(channel, ts, "eyes")
     final_reaction = "white_check_mark"  # mutated below if anything fails
+    turn_succeeded = False                # set True only if run_tools returns
 
     lock = THREAD_LOCKS.setdefault(thread_ts, asyncio.Lock())
     async with lock:
@@ -1895,12 +1926,18 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
         reply_text: str | None = None
         try:
             reply_text = await run_tools(anth, conversation, thread_ts)
+            turn_succeeded = True
         except Exception as e:
             _emit_error(slack, channel, thread_ts, "run_tools (LLM/tool loop)", e)
             final_reaction = "x"
             slack.remove_reaction(channel, ts, "eyes")
             slack.add_reaction(channel, ts, final_reaction)
-            return  # don't try to save partial state
+            # Do NOT register the thread cursor — leaving the message
+            # un-cursored means the next poll will retry it. (Codex P1
+            # fix 2026-04-28: the previous version advanced the cursor
+            # at the start of handle_message and dropped failed
+            # messages forever.)
+            return False
 
         # Persist conversation. If serialization itself blows up, surface it.
         try:
@@ -1920,6 +1957,14 @@ async def handle_message(slack: SlackClient, anth: anthropic.Anthropic,
         slack.remove_reaction(channel, ts, "eyes")
         slack.add_reaction(channel, ts, final_reaction)
 
+    # Only NOW — after run_tools returned and we've saved + posted —
+    # register the thread cursor so the next poll skips this message.
+    # On any exception above we returned early and never reached here,
+    # so the next poll will retry the message.
+    if turn_succeeded:
+        _register_active_thread(thread_ts, ts)
+    return turn_succeeded
+
 
 async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str) -> int:
     """Single poll cycle: top-level channel messages, THEN active-thread replies.
@@ -1938,14 +1983,21 @@ async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str)
         ts = m.get("ts")
         if not ts:
             continue
-        # advance cursor as we go so a crash mid-batch doesn't re-process all
-        cursor[channel] = ts
-        _save_cursor(cursor)
+        # Codex P1 fix 2026-04-28: advance cursor ONLY after handle_message
+        # returns success. The previous version advanced unconditionally
+        # before processing, so any transient error dropped the message
+        # forever. With per-message retry, dupes are possible only on
+        # crashes mid-turn — the conversation save is idempotent so the
+        # blast radius is small.
+        ok = False
         try:
-            await handle_message(slack, anth, channel, m)
+            ok = await handle_message(slack, anth, channel, m)
         except Exception as e:
             _emit_error(slack, channel, m.get("thread_ts") or ts,
                           "poll_once (outer)", e)
+        if ok:
+            cursor[channel] = ts
+            _save_cursor(cursor)
         n += 1
 
     # Pass 2: poll replies in every active thread.
@@ -1961,17 +2013,19 @@ async def poll_once(slack: SlackClient, anth: anthropic.Anthropic, channel: str)
             r_ts = r.get("ts")
             if not r_ts:
                 continue
-            # Inject thread_ts so handle_message threads under the same parent
             r["thread_ts"] = thread_ts
+            ok = False
             try:
-                await handle_message(slack, anth, channel, r)
+                ok = await handle_message(slack, anth, channel, r)
             except Exception as e:
                 _emit_error(slack, channel, thread_ts,
                               "poll_once (thread reply)", e)
-            # advance the per-thread cursor as we go
-            active[thread_ts]["last_reply_ts"] = r_ts
-            active[thread_ts]["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
-            _save_active_threads(active)
+            if ok:
+                # Only advance the per-thread cursor on success.
+                active[thread_ts]["last_reply_ts"] = r_ts
+                active[thread_ts]["updated_at"] = (
+                    dt.datetime.utcnow().isoformat() + "Z")
+                _save_active_threads(active)
             n += 1
     return n
 

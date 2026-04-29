@@ -251,7 +251,36 @@ async def _run_personalize_direct(args: dict, progress_cb, ledger: TaskLedger,
     slop = sum(1 for e in emails if e.get("slop_pass"))
     progress_cb("copy", n, n, f"{cdt:.0f}s · {slop}/{n} clean")
 
-    # 4. CSV
+    # 4a. HARD-FAIL on empty rows BEFORE writing the CSV.
+    # Codex P1 fix 2026-04-28: the previous version silently dropped
+    # empty rows and shipped the partial CSV with a ✅ — the 894→446
+    # false-success bug. Match run_pilot's behavior: a configurable
+    # threshold of empty rows (default 5%, env CE2_EMPTY_TOLERANCE)
+    # triggers a hard task failure. Set 0 to fail on ANY empty.
+    empty_emails: list[str] = []
+    for lead, em in zip(leads, emails):
+        seq = em.get("sequence") or []
+        s1 = next((s for s in seq if s.get("step") == 1), None)
+        if (not s1
+                or not (s1.get("body") or "").strip()
+                or not (s1.get("subject") or "").strip()):
+            empty_emails.append(lead.email)
+    empty_count = len(empty_emails)
+    empty_pct = 100.0 * empty_count / max(n, 1)
+    tolerance_pct = float(os.environ.get("CE2_EMPTY_TOLERANCE", "5.0"))
+    if empty_pct > tolerance_pct:
+        raise RuntimeError(
+            f"Copy squad produced {empty_count}/{n} ({empty_pct:.1f}%) "
+            f"empty sequences — exceeds tolerance ({tolerance_pct:.1f}%). "
+            f"Refusing to ship a partial CSV with a green checkmark. "
+            f"First 5 broken leads: {empty_emails[:5]}. "
+            f"Cause is likely Anthropic rate-limit throttling at "
+            f"concurrency={cp}; reduce CE2_COPY_PARALLEL or raise "
+            f"CE2_EMPTY_TOLERANCE and retry."
+        )
+
+    # 4b. Write the CSV (below threshold, so we still drop empties but
+    # are honest about the count in the result).
     progress_cb("writing_csv", 0, 1, "")
     cols = ["email", "first_name", "last_name", "company_name", "title",
              "linkedin_url",
@@ -393,11 +422,28 @@ async def _run_council_direct(args: dict, progress_cb, ledger: TaskLedger,
 
 async def _await_legacy_tool(initial_result: dict | Any,
                                   ledger: TaskLedger, task_id: str) -> dict:
-    """For legacy tools that return {started: True, task_id: <legacy>}, just
-    pass through the initial result. The worker is structurally sync-style;
-    if a tool needs async monitoring, it should be wrapped in one of the
-    direct paths above instead."""
+    """Legacy fire-and-forget tools (those that asyncio.create_task internally
+    and return {started: True, task_id: ...}) are INCOMPATIBLE with the
+    worker model — the worker would mark the task completed while the actual
+    work is still running in the concierge process.
+
+    Codex P1 fix 2026-04-28: refuse these explicitly. The worker can only
+    run direct-mode tools (personalize_to_csv, spawn_subagent, council_review)
+    that block on the actual work. If you need a legacy tool, call it from
+    the concierge tool registry directly, not via the ledger.
+    """
     if isinstance(initial_result, dict):
+        if initial_result.get("started") is True:
+            raise RuntimeError(
+                f"legacy fire-and-forget result not supported in worker: "
+                f"{initial_result.get('tool', '?')} returned "
+                f"started=True (legacy task_id={initial_result.get('task_id')}). "
+                f"This task would falsely mark itself completed while work "
+                f"runs elsewhere. Use a direct-mode tool instead: "
+                f"personalize_to_csv, spawn_subagent, council_review, "
+                f"import_csv_to_smartlead, update_campaign_schedule, or "
+                f"any read-only tool."
+            )
         return initial_result
     return {"value": str(initial_result)}
 
